@@ -1,0 +1,7 @@
+export type Card = { id: string; set_id: string; term: string; definition: string; phonetic: string; example: string; example_translation: string; notes: string; synonyms: string; antonyms: string; tags: string[]; favorite: boolean; difficult: boolean; mastered: boolean; position: number; created_at?: string; progress?: Progress };
+export type SetRecord = { id: string; owner_id: string; title: string; description: string; source_language: string; target_language: string; folder_id: string | null; visibility: 'private' | 'public'; tags: string[]; cover_color: string; created_at: string; updated_at: string; card_count?: number; mastered_count?: number; access_role?: 'owner' | 'editor' | 'viewer' };
+export type Progress = { card_id: string; user_id: string; state: 'new' | 'learning' | 'review' | 'relearning' | 'mastered'; ease: number; interval_days: number; repetitions: number; lapses: number; correct_count: number; wrong_count: number; last_reviewed_at: string | null; due_at: string };
+export type Session = { id: string; set_id: string; mode: string; correct: number; total: number; duration_seconds: number; created_at: string };
+export type Profile = { id: string; display_name: string; learning_language: string; daily_goal: number };
+export type Folder = { id: string; owner_id: string; name: string; created_at: string };
+export type AppData = { sets: SetRecord[]; cards: Card[]; sessions: Session[]; profile: Profile | null; folders?: Folder[] };
