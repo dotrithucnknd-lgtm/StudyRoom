@@ -1,9 +1,11 @@
 ﻿'use client';
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { motion, AnimatePresence } from 'framer-motion';
-import { ResponsiveContainer, BarChart, Bar, XAxis, Tooltip } from 'recharts';
+import dynamic from 'next/dynamic';
 import { Button } from '@/components/ui/button';
 import { SetEditor, newEditorCard, type EditorCard } from '@/components/SetEditor';
+import { LearnSession } from '@/components/LearnSession';
+/** The chart library is large; load it only when a chart is on screen. */
+const ActivityChart = dynamic(() => import('@/components/ActivityChart'), { ssr: false, loading: () => <div className="skeleton" style={{ height: 170, marginTop: 12 }} /> });
 import { supabase, configured, googleEnabled } from '@/lib/supabase';
 import { demoData } from '@/lib/demo';
 import { CARD_BATCH } from '@/lib/limits';
@@ -80,11 +82,9 @@ export default function Page() {
   const [answered, setAnswered] = useState(0);
   const [answer, setAnswer] = useState('');
   const [feedback, setFeedback] = useState<'correct' | 'wrong' | null>(null);
-  const [learnStages, setLearnStages] = useState<Record<string, 'choice' | 'typing'>>({});
-  const [learnChoice, setLearnChoice] = useState('');
-  const [learnMastered, setLearnMastered] = useState<string[]>([]);
-  const [learnAttempts, setLearnAttempts] = useState(0);
-  const [learnTotal, setLearnTotal] = useState(0);
+  const [learnKey, setLearnKey] = useState(0);
+  /** Cards a quiz was built from (e.g. words missed while learning), so "Học lại" repeats the same quiz. */
+  const [testPool, setTestPool] = useState<Card[] | null>(null);
   const [matchSelection, setMatchSelection] = useState<{ type: 'term' | 'definition'; id: string } | null>(null);
   const [matched, setMatched] = useState<string[]>([]);
   const [wrongMatch, setWrongMatch] = useState(false);
@@ -109,13 +109,6 @@ export default function Page() {
   const canEditActiveCards = ownsActiveSet || activeSet?.access_role === 'editor';
   const activeCards = data.cards.filter(c => c.set_id === selectedId);
   const allCards = data.cards;
-  const learnOptions = useMemo(() => {
-    const current = deck[index];
-    if (!current || view !== 'learn') return [];
-    const value = (card: Card) => reverse ? card.term : card.definition;
-    const others = [...new Set(studySource.filter(c => c.id !== current.id).map(value).filter(v => normalizeAnswer(v) !== normalizeAnswer(value(current))))];
-    return shuffle([value(current), ...shuffle(others).slice(0, 3)]);
-  }, [deck[index]?.id, index, reverse, studySource, view]);
   const due = allCards.filter(c => c.progress && new Date(c.progress.due_at) <= new Date() && c.progress.state !== 'mastered');
   const dueCount = demo ? due.length : overview.due;
   const mastered = demo ? allCards.filter(c => c.mastered || c.progress?.state === 'mastered').length : overview.mastered;
@@ -289,47 +282,30 @@ export default function Page() {
   async function exportSet(set: SetRecord, format: 'csv' | 'tsv' | 'json') { try { const cards = demo ? data.cards.filter(c => c.set_id === set.id) : await fetchAllCards(set.id); const fields = ['term', 'definition', 'phonetic', 'example', 'example_translation', 'notes', 'synonyms', 'antonyms'] as const; const content = format === 'json' ? JSON.stringify({ set: { title: set.title, description: set.description, source_language: set.source_language, target_language: set.target_language }, cards: cards.map(c => Object.fromEntries(fields.map(f => [f, c[f]]))) }, null, 2) : [fields.join(format === 'csv' ? ',' : '\t'), ...cards.map(c => fields.map(f => csvEscape(c[f], format === 'csv' ? ',' : '\t')).join(format === 'csv' ? ',' : '\t'))].join('\r\n'); download(`${set.title.replace(/[^\p{L}\p{N}-]+/gu, '-')}.${format}`, content, format === 'json' ? 'application/json' : 'text/plain;charset=utf-8'); } catch (e) { toast((e as Error).message); } }
   async function saveSession(mode: Session['mode'], resultCorrect: number, total: number) { const setId = selectedId || deck[0]?.set_id; if (!setId) return; const entry: Session = { id: crypto.randomUUID(), set_id: setId, mode, correct: resultCorrect, total, duration_seconds: Math.max(1, Math.round((Date.now() - studyStart) / 1000)), created_at: new Date().toISOString() }; try { if (!demo) await api('activity', 'POST', { kind: 'session', set_id: setId, mode, correct: resultCorrect, total, duration_seconds: entry.duration_seconds }); updateData(d => ({ ...d, sessions: [entry, ...d.sessions] })); } catch (e) { toast((e as Error).message); } }
   async function rateCard(card: Card, rating: Rating) { try { const next: Progress = demo ? { ...scheduleReview(card.progress, rating), card_id: card.id, user_id: 'demo' } : await api('activity', 'POST', { kind: 'review', card_id: card.id, rating }); updateData(d => ({ ...d, cards: d.cards.map(c => c.id === card.id ? { ...c, progress: next, mastered: next.state === 'mastered' } : c) })); if (!demo) setOverview(o => ({ ...o, due: Math.max(0, o.due - Number(Boolean(card.progress && new Date(card.progress.due_at) <= new Date()))), mastered: Math.max(0, o.mastered + Number(next.state === 'mastered') - Number(card.progress?.state === 'mastered')) })); } catch (e) { toast((e as Error).message); } }
-  async function beginMode(mode: View, globalReview = false) {
-    let source = mode === 'review' ? (globalReview ? allCards : activeCards).filter(c => !c.progress || new Date(c.progress.due_at) <= new Date()) : activeCards;
+  async function beginMode(mode: View, globalReview = false, pool?: Card[]) {
+    setTestPool(pool && mode === 'test' ? pool : null);
+    let source = pool ? pool : mode === 'review' ? (globalReview ? allCards : activeCards).filter(c => !c.progress || new Date(c.progress.due_at) <= new Date()) : activeCards;
     if (mode === 'review' && globalReview) { setSelectedId(null); if (!demo) { try { source = []; for (let page = 0; ; page++) { const result = await api(`review?page=${page}`); source.push(...result.cards); if ((page + 1) * 100 >= result.total || !result.cards.length) break; } } catch (e) { toast((e as Error).message); return; } } }
-    else if (!demo && selectedId && mode !== 'review' && (activeSet?.card_count || 0) > activeCards.length) {
+    else if (!pool && !demo && selectedId && mode !== 'review' && (activeSet?.card_count || 0) > activeCards.length) {
       try { source = await fetchAllCards(selectedId); } catch (e) { toast((e as Error).message); return; }
     }
     else if (!demo && selectedId && mode === 'review' && (activeSet?.card_count || 0) > activeCards.length) {
       try { source = (await fetchAllCards(selectedId)).filter(c => !c.progress || new Date(c.progress.due_at) <= new Date()); } catch (e) { toast((e as Error).message); return; }
     }
     setStudySource(source);
-    let filtered = source.filter(c => filter === 'all' || (filter === 'unmastered' && !c.mastered) || (filter === 'difficult' && c.difficult) || (filter === 'favorite' && c.favorite));
+    let filtered = pool ? source : source.filter(c => filter === 'all' || (filter === 'unmastered' && !c.mastered) || (filter === 'difficult' && c.difficult) || (filter === 'favorite' && c.favorite));
     if (mode === 'review' && demo && globalReview && !filtered.length) filtered = allCards.filter(c => !c.mastered);
     const next = shuffle(filtered);
-    setDeck(next); setIndex(0); setFlipped(false); if (mode === 'learn') setReverse(false); setStudyStart(Date.now()); setElapsed(0); setCorrect(0); setAnswered(0); setAnswer(''); setFeedback(null); setLearnStages({}); setLearnChoice(''); setLearnMastered([]); setLearnAttempts(0); setLearnTotal(next.length); setMatched([]); setMatchSelection(null); setWrongMatch(false); setTestAnswers({}); setTestDone(false); setTestStarted(false); setTestNumber(Math.min(10, next.length));
+    setDeck(next); setIndex(0); setFlipped(false); if (mode === 'learn') setReverse(false); setStudyStart(Date.now()); setElapsed(0); setCorrect(0); setAnswered(0); setAnswer(''); setFeedback(null); setLearnKey(k => k + 1); setMatched([]); setMatchSelection(null); setWrongMatch(false); setTestAnswers({}); setTestDone(false); setTestStarted(false); setTestNumber(pool ? next.length : Math.min(10, next.length));
     const uniquePairs = next.filter((card, position, cards) => cards.findIndex(c => normalizeAnswer(c.term) === normalizeAnswer(card.term) || normalizeAnswer(c.definition) === normalizeAnswer(card.definition)) === position).slice(0, 6);
     setMatchTerms(shuffle(uniquePairs)); setMatchDefinitions(shuffle(uniquePairs)); setView(mode);
   }
   function nextCard() { setIndex(i => i + 1); setFlipped(false); setAnswer(''); setFeedback(null); }
   function previousCard() { setIndex(i => Math.max(0, i - 1)); setFlipped(false); setAnswer(''); setFeedback(null); }
   function changeFilter(next: typeof filter) { setFilter(next); const filtered = studySource.filter(c => next === 'all' || (next === 'unmastered' && !c.mastered) || (next === 'difficult' && c.difficult) || (next === 'favorite' && c.favorite)); setDeck(shuffle(filtered)); setIndex(0); setFlipped(false); }
-  function startTest() { const selected = deck.slice(0, Math.min(testNumber, deck.length)); const choices: Record<string, string[]> = {}; selected.forEach(card => { const distractors = shuffle([...new Set(deck.filter(c => c.id !== card.id).map(c => c.definition).filter(d => normalizeAnswer(d) !== normalizeAnswer(card.definition)))]).slice(0, 3); choices[card.id] = shuffle([card.definition, ...distractors]); }); setDeck(selected); setTestChoices(choices); setTestStarted(true); setStudyStart(Date.now()); }
+  function startTest() { const selected = deck.slice(0, Math.min(testNumber, deck.length)); const choices: Record<string, string[]> = {}; selected.forEach(card => { const distractors = shuffle([...new Set((activeCards.length > deck.length ? activeCards : deck).filter(c => c.id !== card.id).map(c => c.definition).filter(d => normalizeAnswer(d) !== normalizeAnswer(card.definition)))]).slice(0, 3); choices[card.id] = shuffle([card.definition, ...distractors]); }); setDeck(selected); setTestChoices(choices); setTestStarted(true); setStudyStart(Date.now()); }
   useEffect(() => { if (view !== 'flashcards') return; const handler = (e: KeyboardEvent) => { if (e.target instanceof HTMLInputElement || e.target instanceof HTMLTextAreaElement) return; if (e.code === 'Space') { e.preventDefault(); setFlipped(f => !f); } if (e.code === 'ArrowRight') nextCard(); if (e.code === 'ArrowLeft') previousCard(); }; window.addEventListener('keydown', handler); return () => window.removeEventListener('keydown', handler); }, [view]);
-  async function submitLearn(value = answer, skip = false) {
-    const card = deck[index];
-    if (!card || feedback) return;
-    const stage = learnStages[card.id] || (learnTotal < 2 ? 'typing' : 'choice');
-    if (stage === 'typing' && !value.trim() && !skip) return;
-    const ok = normalizeAnswer(value) === normalizeAnswer(reverse ? card.term : card.definition);
-    setFeedback(ok ? 'correct' : 'wrong'); setLearnAttempts(n => n + 1);
-    if (stage === 'choice') setLearnChoice(value);
-    if (stage === 'typing' && ok) { setLearnMastered(ids => [...ids, card.id]); setCorrect(n => n + 1); }
-    else setDeck(cards => [...cards, card]);
-    if (!ok || stage === 'typing') await rateCard(card, ok ? 'good' : 'again');
-  }
-  function advanceLearn() {
-    const card = deck[index];
-    if (!card || !feedback) return;
-    if (feedback === 'correct' && (learnStages[card.id] || (learnTotal < 2 ? 'typing' : 'choice')) === 'choice') setLearnStages(stages => ({ ...stages, [card.id]: 'typing' }));
-    if (index + 1 >= deck.length) { void saveSession('learn', learnMastered.length, learnTotal); setIndex(deck.length); }
-    else { nextCard(); setLearnChoice(''); }
-  }
+  const onLearnFinish = useCallback((masteredCount: number, total: number) => { void saveSession('learn', masteredCount, total); }, [selectedId, deck, studyStart, demo]);
   function chooseMatch(type: 'term' | 'definition', id: string) { if (matched.includes(id)) return; if (!matchSelection) return setMatchSelection({ type, id }); if (matchSelection.type === type) return setMatchSelection({ type, id }); if (matchSelection.id === id) { const next = [...matched, id]; setMatched(next); setMatchSelection(null); setCorrect(c => c + 1); if (next.length === matchTerms.length) saveSession('match', next.length, next.length); } else { setWrongMatch(true); setTimeout(() => { setWrongMatch(false); setMatchSelection(null); }, 500); } }
   async function finishTest() { const result = deck.reduce((sum, c) => sum + Number(normalizeAnswer(testAnswers[c.id] || '') === normalizeAnswer(c.definition)), 0); setCorrect(result); setTestDone(true); await saveSession('test', result, deck.length); }
   async function saveProfile() { try { if (!demo) await api('activity', 'POST', { kind: 'profile', display_name: profileName, learning_language: learningLanguage, daily_goal: dailyGoal }); updateData(d => ({ ...d, profile: { id: userId || 'demo', display_name: profileName, learning_language: learningLanguage, daily_goal: dailyGoal } })); toast('Đã lưu cài đặt.'); } catch (e) { toast((e as Error).message); } }
@@ -407,7 +383,7 @@ export default function Page() {
 
     <main className="main" id="main">
 
-      <div className={`content ${view === 'editor' ? 'narrow' : ''}`}><AnimatePresence mode="wait"><motion.div key={view + (selectedId || '')} initial={{ opacity: 0, y: 6 }} animate={{ opacity: 1, y: 0 }} exit={{ opacity: 0 }} transition={{ duration: .16 }}>
+      <div className={`content ${view === 'editor' ? 'narrow' : ''}`}><div key={view + (selectedId || '')} className="view-fade">
 
         {view === 'dashboard' && <>
           <div className="welcome"><h1>Chào {data.profile?.display_name || 'bạn'} 👋</h1><p>Mỗi từ mới là một bước gần hơn đến mục tiêu của bạn.</p></div>
@@ -485,9 +461,9 @@ export default function Page() {
           <div className="study-top">
             <button className="btn ghost small" onClick={() => setView(selectedId ? 'set' : 'dashboard')}><X /> Thoát</button>
             <div className="study-title"><span className={`tone-icon sm ${modes.find(m => m.id === view)?.tone}`}>{(() => { const M = modes.find(m => m.id === view)?.icon || Layers3; return <M size={15} />; })()}</span><strong>{modes.find(m => m.id === view)?.name}</strong>{activeSet && <span className="muted hide-sm">· {activeSet.title}</span>}</div>
-            <span className="study-count">{view === 'learn' ? `${learnMastered.length}/${learnTotal}` : view === 'match' ? `${matched.length}/${matchTerms.length}` : `${Math.min(index + 1, deck.length)}/${deck.length}`}</span>
+            <span className="study-count">{view === 'learn' ? '' : view === 'match' ? `${matched.length}/${matchTerms.length}` : `${Math.min(index + 1, deck.length)}/${deck.length}`}</span>
           </div>
-          {view !== 'test' && <div className="study-progress" role="progressbar" aria-label="Tiến độ" aria-valuemin={0} aria-valuemax={100} aria-valuenow={Math.round(view === 'learn' ? learnMastered.length / Math.max(1, learnTotal) * 100 : view === 'match' ? matched.length / Math.max(1, matchTerms.length) * 100 : Math.min(index + 1, deck.length) / Math.max(1, deck.length) * 100)}><span style={{ width: `${view === 'learn' ? learnMastered.length / Math.max(1, learnTotal) * 100 : view === 'match' ? matched.length / Math.max(1, matchTerms.length) * 100 : Math.min(index + 1, deck.length) / Math.max(1, deck.length) * 100}%` }} /></div>}
+          {view !== 'test' && view !== 'learn' && <div className="study-progress" role="progressbar" aria-label="Tiến độ" aria-valuemin={0} aria-valuemax={100} aria-valuenow={Math.round(view === 'match' ? matched.length / Math.max(1, matchTerms.length) * 100 : Math.min(index + 1, deck.length) / Math.max(1, deck.length) * 100)}><span style={{ width: `${view === 'match' ? matched.length / Math.max(1, matchTerms.length) * 100 : Math.min(index + 1, deck.length) / Math.max(1, deck.length) * 100}%` }} /></div>}
           {deck.length === 0 ? <Empty title="Chưa có thẻ để học" text="Thêm thẻ vào bộ từ, hoặc quay lại sau khi có từ cần ôn." action="Về thư viện" onClick={() => setView('library')} /> : <>
 
             {view === 'flashcards' && <>
@@ -516,7 +492,7 @@ export default function Page() {
               </>}
             </>}
 
-            {view === 'learn' && <LearnPanel card={deck[index]} stage={learnStages[deck[index]?.id] || (learnTotal < 2 ? 'typing' : 'choice')} options={learnOptions} choice={learnChoice} answer={answer} feedback={feedback} mastered={learnMastered.length} total={learnTotal} attempts={learnAttempts} onChoice={value => { void submitLearn(value); }} onAnswer={setAnswer} onSubmit={() => { void submitLearn(); }} onSkip={() => { void submitLearn('', true); }} onNext={advanceLearn} onRestart={() => beginMode('learn')} onBack={() => setView('set')} />}
+            {view === 'learn' && <LearnSession key={learnKey} cards={deck} setId={selectedId} onRate={(card, rating) => { void rateCard(card, rating); }} onFinish={onLearnFinish} onQuiz={missed => { void beginMode('test', false, missed); toast(`Quiz ${missed.length} từ bạn đã trả lời sai.`); }} onBack={() => setView(selectedId ? 'set' : 'dashboard')} onSpeak={text => { if (!pronounce(text, activeSet?.source_language)) toast('Trình duyệt này không hỗ trợ phát âm.'); }} />}
 
             {view === 'review' && <>{index >= deck.length ? <Result correct={correct} total={deck.length} onAgain={() => beginMode('review')} onBack={() => setView(selectedId ? 'set' : 'dashboard')} /> : <>
               <FlipCard flipped={flipped} onFlip={() => setFlipped(v => !v)} frontLabel="Bạn còn nhớ từ này?" backLabel="Nghĩa" front={deck[index].term} back={deck[index].definition} frontHint={deck[index].phonetic} backHint={deck[index].example} />
@@ -535,7 +511,7 @@ export default function Page() {
             {view === 'test' && <>
               {!testStarted ? <div className="panel test-setup">
                 <span className="tone-icon blue"><GraduationCap size={20} /></span>
-                <h2>Chuẩn bị bài kiểm tra</h2>
+                <h2>{testPool ? `Quiz ${testPool.length} từ đã sai` : 'Chuẩn bị bài kiểm tra'}</h2>
                 <p className="muted">Chọn số câu và cách trả lời trước khi bắt đầu.</p>
                 <div className="form-grid">
                   <label className="field"><span>Số câu hỏi (tối đa {deck.length})</span><input className="input" type="number" min="1" max={deck.length} value={testNumber} onChange={e => setTestNumber(Math.max(1, Math.min(deck.length, Number(e.target.value))))} /></label>
@@ -543,7 +519,7 @@ export default function Page() {
                 </div>
                 <button className="btn primary big" onClick={startTest}><Play /> Bắt đầu kiểm tra</button>
               </div> : testDone ? <div>
-                <Result correct={correct} total={deck.length} onAgain={() => beginMode('test')} onBack={() => setView('set')} />
+                <Result correct={correct} total={deck.length} onAgain={() => beginMode('test', false, testPool || undefined)} onBack={() => setView(selectedId ? 'set' : 'dashboard')} />
                 <div className="panel review-answers"><h3>Xem lại đáp án</h3>{deck.map((c, i) => { const ok = normalizeAnswer(testAnswers[c.id] || '') === normalizeAnswer(c.definition); return <div key={c.id} className={`answer-review ${ok ? 'ok' : 'bad'}`}><span className="answer-mark" aria-label={ok ? 'Đúng' : 'Sai'}>{ok ? <Check size={14} /> : <X size={14} />}</span><div><strong>{i + 1}. {c.term}</strong><p>Bạn trả lời: {testAnswers[c.id] || <em>Bỏ trống</em>}</p>{!ok && <small>Đáp án: {c.definition}</small>}</div></div>; })}</div>
               </div> : <>
                 <div className="between test-head"><h2>Bài kiểm tra</h2><span className="pill">{Object.values(testAnswers).filter(Boolean).length}/{deck.length} đã trả lời</span></div>
@@ -588,7 +564,7 @@ export default function Page() {
             {demo && <p className="muted small" style={{ marginTop: 24 }}>Dữ liệu demo chỉ lưu trên trình duyệt hiện tại. Đăng nhập để đồng bộ.</p>}
           </div>
         </>}
-      </motion.div></AnimatePresence></div>
+      </div></div>
     </main>
 
     {!inStudy && <footer className="site-footer">
@@ -634,37 +610,6 @@ export default function Page() {
   </div>;
 }
 
-function LearnPanel({ card, stage, options, choice, answer, feedback, mastered, total, attempts, onChoice, onAnswer, onSubmit, onSkip, onNext, onRestart, onBack }: { card: Card | undefined; stage: 'choice' | 'typing'; options: string[]; choice: string; answer: string; feedback: 'correct' | 'wrong' | null; mastered: number; total: number; attempts: number; onChoice: (value: string) => void; onAnswer: (value: string) => void; onSubmit: () => void; onSkip: () => void; onNext: () => void; onRestart: () => void; onBack: () => void }) {
-  // Number keys pick an option and Enter continues, as in Quizlet Learn.
-  useEffect(() => {
-    if (!card) return;
-    const onKey = (e: KeyboardEvent) => {
-      if (e.target instanceof HTMLInputElement || e.target instanceof HTMLTextAreaElement || e.target instanceof HTMLButtonElement) return;
-      if (feedback && e.key === 'Enter') { e.preventDefault(); onNext(); return; }
-      const n = Number(e.key); if (!feedback && stage === 'choice' && n >= 1 && n <= options.length) onChoice(options[n - 1]);
-    };
-    window.addEventListener('keydown', onKey); return () => window.removeEventListener('keydown', onKey);
-  }, [card, feedback, stage, options, onChoice, onNext]);
-  if (!card) return <Result correct={mastered} total={total} onAgain={onRestart} onBack={onBack} />;
-  const expected = card.definition;
-  return <div className="learn-screen">
-    <div className="panel learn-panel">
-      <div className="learn-question"><div className="between"><span className="eyebrow">Từ</span><span className={`stage-pill ${stage}`}>{stage === 'choice' ? 'Bước 1 · Chọn đáp án' : 'Bước 2 · Tự gõ lại'}</span></div><div className="learn-word">{card.term}</div></div>
-      <p className="learn-prompt">{stage === 'choice' ? 'Chọn nghĩa đúng' : 'Gõ nghĩa'}</p>
-      {stage === 'choice' ? <div className="learn-options">{options.map((option, i) => { const isRight = feedback && normalizeAnswer(option) === normalizeAnswer(expected); const isWrong = feedback && !isRight && option === choice; return <button key={`${option}-${i}`} className={`answer-option ${isRight ? 'correct' : isWrong ? 'wrong' : ''}`} disabled={!!feedback} onClick={() => onChoice(option)}><span className="option-key">{isRight ? <Check size={14} /> : isWrong ? <X size={14} /> : i + 1}</span><span>{option}</span></button>; })}</div>
-        : <div className="learn-input"><input className={`input big ${feedback || ''}`} autoFocus aria-label="Câu trả lời của bạn" value={answer} disabled={!!feedback} onChange={e => onAnswer(e.target.value)} onKeyDown={e => e.key === 'Enter' && (feedback ? onNext() : onSubmit())} placeholder="Nhập câu trả lời" /></div>}
-      {feedback && <div className={`learn-feedback ${feedback}`} role="status">{feedback === 'correct' ? <Check size={18} /> : <X size={18} />}<div><strong>{feedback === 'correct' ? 'Chính xác! Làm tốt lắm.' : 'Chưa đúng – bạn sẽ gặp lại từ này.'}</strong>{feedback === 'wrong' && <span>Đáp án đúng: {expected}</span>}</div></div>}
-      <div className="learn-actions">
-        <span className="muted small">{feedback ? 'Nhấn Enter hoặc nút bên cạnh để tiếp tục' : stage === 'typing' ? 'Nhấn Enter để kiểm tra' : `Nhấn phím 1–${options.length} để chọn`}</span>
-        {stage === 'typing' && !feedback && <button className="btn ghost" onClick={onSkip}>Không biết?</button>}
-        {stage === 'typing' && !feedback && <button className="btn primary" disabled={!answer.trim()} onClick={onSubmit}>Trả lời</button>}
-        {feedback && <button className="btn primary" onClick={onNext}>Tiếp tục <ArrowRight /></button>}
-      </div>
-    </div>
-    <p className="muted small learn-meta">{mastered}/{total} từ đã thuộc · {attempts} lượt trả lời</p>
-  </div>;
-}
-
 function FlipCard({ front, back, frontLabel, backLabel, frontHint, backHint, flipped, onFlip, compact }: { front?: string; back?: string; frontLabel: string; backLabel: string; frontHint?: string; backHint?: string; flipped: boolean; onFlip: () => void; compact?: boolean }) {
   return <div className={`flip ${flipped ? 'is-flipped' : ''} ${compact ? 'compact' : ''}`} role="button" tabIndex={0} aria-pressed={flipped} aria-label={flipped ? `${backLabel}: ${back}. Nhấn để lật lại` : `${frontLabel}: ${front}. Nhấn để lật thẻ`}
     onClick={onFlip} onKeyDown={e => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); e.stopPropagation(); onFlip(); } }}>
@@ -695,7 +640,6 @@ function SetCard({ set, onClick }: { set: SetRecord; onClick: () => void }) { re
 function Empty({ title, text, action, onClick }: { title: string; text: string; action: string; onClick: () => void }) { return <div className="empty"><span className="tone-icon violet"><BookOpen size={22} /></span><h3>{title}</h3><p>{text}</p><Button onClick={onClick}>{action} <ArrowRight /></Button></div>; }
 function Result({ correct, total, onAgain, onBack, extra }: { correct: number; total: number; onAgain: () => void; onBack: () => void; extra?: string }) { const pct = Math.round(correct / Math.max(1, total) * 100); return <div className="panel result"><span className="tone-icon green big"><Trophy size={26} /></span><h1>{pct >= 80 ? 'Xuất sắc!' : pct >= 50 ? 'Làm tốt lắm!' : 'Tiếp tục cố gắng nhé!'}</h1><p className="muted">Bạn đã hoàn thành lượt học này.</p><div className="result-score"><strong>{correct}/{total}</strong><span>đúng · {pct}%</span></div>{extra && <p className="muted small">{extra}</p>}<div className="study-controls"><button className="btn" onClick={onBack}>Quay lại bộ từ</button><button className="btn primary" onClick={onAgain}><RotateCcw /> Học lại</button></div></div>; }
 function DiscoverPanel({ searchBox, sets, total, onOpen, onMore, onCreate }: { searchBox: React.ReactNode; sets: SetRecord[]; total: number; onOpen: (id: string) => void; onMore: () => void; onCreate: () => void }) { return <><div className="welcome"><h1>Khám phá bộ từ</h1><p>{total} bộ từ được chia sẻ công khai bởi mọi người.</p></div>{searchBox}{sets.length ? <div className="set-grid">{sets.map(s => <SetCard key={s.id} set={s} onClick={() => onOpen(s.id)} />)}</div> : <Empty title="Chưa có bộ từ công khai" text="Hãy tạo bộ từ và chọn “Mọi người” ở quyền xem để chia sẻ." action="Tạo bộ từ" onClick={onCreate} />}{sets.length < total && <div className="center-row"><button className="btn" onClick={onMore}>Tải thêm <ChevronRight /></button></div>}</>; }
-function ActivityChart({ days, height }: { days: { label: string; value: number }[]; height: number }) { return <div style={{ width: '100%', height, marginTop: 12 }}><ResponsiveContainer width="100%" height="100%"><BarChart data={days} margin={{ top: 10, right: 0, bottom: 0, left: 0 }}><XAxis dataKey="label" axisLine={false} tickLine={false} tick={{ fill: 'var(--muted)', fontSize: 12 }} /><Tooltip cursor={{ fill: 'var(--soft)' }} contentStyle={{ background: 'var(--panel)', border: '1px solid var(--line)', borderRadius: 10, color: 'var(--ink)' }} formatter={(value) => [`${value} từ`, 'Đã học']} /><Bar dataKey="value" fill="var(--chart)" radius={[8, 8, 3, 3]} maxBarSize={34} /></BarChart></ResponsiveContainer></div>; }
 function FolderBar({ folders, selected, onSelect, onAdd, onEdit, onDelete }: { folders: Folder[]; selected: string; onSelect: (id: string) => void; onAdd: () => void; onEdit: (folder: Folder) => void; onDelete: (folder: Folder) => void }) {
   const current = folders.find(f => f.id === selected);
   return <div className="folder-bar">

@@ -100,7 +100,11 @@
 /* ============ Base ============ */
 * { box-sizing: border-box }
 html { scroll-behavior: smooth; -webkit-text-size-adjust: 100% }
-body { margin: 0; background: var(--bg-art); background-color: var(--bg); background-attachment: fixed; color: var(--ink); font-family: 'Be Vietnam Pro', 'Noto Sans', system-ui, sans-serif; font-size: 15px; line-height: 1.55; -webkit-font-smoothing: antialiased }
+body { margin: 0; background-color: var(--bg); color: var(--ink); font-family: 'Be Vietnam Pro', 'Noto Sans', system-ui, sans-serif; font-size: 15px; line-height: 1.55; -webkit-font-smoothing: antialiased }
+/* Painted once on its own layer; background-attachment: fixed repainted the whole page on every scroll. */
+body::before { content: ''; position: fixed; inset: 0; z-index: -1; background: var(--bg-art); pointer-events: none }
+.view-fade { animation: view-in .18s var(--ease) }
+@keyframes view-in { from { opacity: 0; transform: translateY(6px) } }
 button, input, textarea, select { font: inherit; color: inherit }
 button { cursor: pointer }
 button:disabled { cursor: not-allowed; opacity: .5 }
@@ -390,6 +394,24 @@ kbd { font: 600 11px/1 ui-monospace, SFMono-Regular, Consolas, monospace; paddin
 .learn-actions { display: flex; align-items: center; justify-content: flex-end; gap: 10px; flex-wrap: wrap; margin-top: 22px }
 .learn-actions > .muted { margin-right: auto }
 .learn-meta { text-align: center; margin-top: 14px }
+.learn-toolbar { display: flex; align-items: center; justify-content: space-between; gap: 12px; flex-wrap: wrap; margin-bottom: 14px }
+.learn-toolbar .segmented { flex: 0 1 380px }
+.learn-toolbar .segmented button { padding: 0 12px; white-space: nowrap }
+.learn-ask { display: inline-flex; align-items: center; gap: 8px }
+.learn-progress { display: flex; align-items: center; gap: 12px; margin-bottom: 16px }
+.learn-progress .study-progress { flex: 1; margin: 0; height: 8px }
+.learn-progress .study-progress span { background: var(--success) }
+.learn-progress > span { white-space: nowrap }
+.learn-panel { transition: border-color .2s, box-shadow .2s }
+.learn-panel.is-correct { border-color: var(--success); box-shadow: 0 0 0 3px var(--success-bg), var(--shadow) }
+.learn-panel.is-wrong { border-color: color-mix(in srgb, var(--danger) 55%, transparent) }
+.learn-word { display: flex; align-items: center; gap: 8px }
+.learn-speak { flex: none }
+.missed-list { margin-top: 18px }
+.missed-list h3 { margin: 0 0 12px }
+.missed-list ul { list-style: none; margin: 0; padding: 0; display: grid; gap: 8px; max-height: 360px; overflow: auto }
+.missed-list li { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1.4fr); gap: 14px; padding: 10px 14px; border-radius: 12px; background: var(--danger-bg); overflow-wrap: anywhere }
+.missed-list li span { color: var(--ink-2) }
 
 /* Match */
 .match-head { margin-bottom: 14px }

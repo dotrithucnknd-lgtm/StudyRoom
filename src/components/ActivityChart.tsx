@@ -1,0 +1,4 @@
+'use client';
+import { ResponsiveContainer, BarChart, Bar, XAxis, Tooltip } from 'recharts';
+
+export default function ActivityChart({ days, height }: { days: { label: string; value: number }[]; height: number }) { return <div style={{ width: '100%', height, marginTop: 12 }}><ResponsiveContainer width="100%" height="100%"><BarChart data={days} margin={{ top: 10, right: 0, bottom: 0, left: 0 }}><XAxis dataKey="label" axisLine={false} tickLine={false} tick={{ fill: 'var(--muted)', fontSize: 12 }} /><Tooltip cursor={{ fill: 'var(--soft)' }} contentStyle={{ background: 'var(--panel)', border: '1px solid var(--line)', borderRadius: 10, color: 'var(--ink)' }} formatter={(value) => [`${value} từ`, 'Đã học']} /><Bar dataKey="value" fill="var(--chart)" radius={[8, 8, 3, 3]} maxBarSize={34} /></BarChart></ResponsiveContainer></div>; }
