@@ -94,6 +94,7 @@ export function SetEditor({ mode, initialSet, initialCards, canEditMeta, folders
   const [drag, setDrag] = useState<{ from: number; over: number } | null>(null);
   const fields = useRef(new Map<string, HTMLTextAreaElement>());
   const titleRef = useRef<HTMLTextAreaElement | null>(null);
+  const savedRef = useRef(false); // once saved, a pending autosave must not bring the draft back
   const pendingFocus = useRef<string | null>(focusKey ? `${focusKey}:term` : mode === 'create' ? 'title' : null);
   const filledCount = cards.filter(c => !isBlank(c)).length;
 
@@ -124,7 +125,7 @@ export function SetEditor({ mode, initialSet, initialCards, canEditMeta, folders
   // Quizlet autosaves new sets as drafts; mirror that in browser storage.
   useEffect(() => {
     if (mode !== 'create' || !dirty) return;
-    const timer = setTimeout(() => { try { localStorage.setItem(DRAFT_KEY, JSON.stringify({ set, cards: cards.map(({ key: _key, id: _id, ...c }) => c) })); } catch { /* ignore */ } }, 400);
+    const timer = setTimeout(() => { if (savedRef.current) return; try { localStorage.setItem(DRAFT_KEY, JSON.stringify({ set, cards: cards.map(({ key: _key, id: _id, ...c }) => c) })); } catch { /* ignore */ } }, 400);
     return () => clearTimeout(timer);
   }, [set, cards, dirty, mode]);
 
@@ -196,7 +197,7 @@ export function SetEditor({ mode, initialSet, initialCards, canEditMeta, folders
     }
     if (general) return;
     const ok = await onSave({ ...set, title }, cleaned);
-    if (ok && mode === 'create') { try { localStorage.removeItem(DRAFT_KEY); } catch { /* ignore */ } }
+    if (ok && mode === 'create') { savedRef.current = true; try { localStorage.removeItem(DRAFT_KEY); } catch { /* ignore */ } }
   }
 
   const impl = useRef<RowActions>(null!);

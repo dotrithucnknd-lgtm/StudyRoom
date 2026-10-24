@@ -30,6 +30,10 @@ test('import supports semicolon and custom separators with multi-line definition
   assert.equal(rows[0].definition, 'quả táo\nmàu đỏ');
   assert.equal(rows[1].term, 'book');
 });
+test('tab mode also accepts tabs that were turned into spaces when copying', () => {
+  const rows = parseImport('かぞく    Gia đình\nおとうさん　　Bố người khác; bố ơi\nこのひと は    Người này\nなにも', { term: 'tab', card: 'newline' });
+  assert.deepEqual(rows, [{ term: 'かぞく', definition: 'Gia đình' }, { term: 'おとうさん', definition: 'Bố người khác; bố ơi' }, { term: 'このひと は', definition: 'Người này' }, { term: 'なにも', definition: '' }]);
+});
 test('import exposes missing definitions', () => {
   assert.equal(parseImport('unfinished', { term: 'tab', card: 'newline' })[0].definition, '');
 });

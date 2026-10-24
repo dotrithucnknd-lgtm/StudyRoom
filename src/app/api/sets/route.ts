@@ -34,8 +34,13 @@ export async function GET(request: NextRequest) {
 export async function POST(request: NextRequest) {
   const auth = await authorized(request); if (auth instanceof NextResponse) return auth;
   const parsed = shape.safeParse(await request.json()); if (!parsed.success) return failure(new Error('Thông tin bộ từ chưa hợp lệ.'));
-  const { data, error } = await auth.db.from('study_sets').insert({ ...parsed.data, owner_id: auth.userId }).select().single();
-  return error ? failure(error) : NextResponse.json(data, { status: 201 });
+  // Insert without RETURNING: the select policy (can_view_set) can't see a row inserted by the same statement,
+  // so `insert().select()` fails with an RLS error. Read the row back in a separate query instead.
+  const id = crypto.randomUUID();
+  const { error } = await auth.db.from('study_sets').insert({ ...parsed.data, id, owner_id: auth.userId });
+  if (error) return failure(error);
+  const { data, error: readError } = await auth.db.from('study_sets').select().eq('id', id).single();
+  return readError ? failure(readError) : NextResponse.json(data, { status: 201 });
 }
 export async function PATCH(request: NextRequest) {
   const auth = await authorized(request); if (auth instanceof NextResponse) return auth;

@@ -132,7 +132,11 @@ export default function Page() {
     const client = supabase();
     if (!client) { setAuthReady(true); return; }
     if (location.search.includes('code=')) client.auth.exchangeCodeForSession(new URLSearchParams(location.search).get('code') || '').then(() => history.replaceState({}, '', '/'));
-    client.auth.getUser().then(({ data: result }) => { setUserId(result.user?.id || null); setAuthReady(true); });
+    client.auth.getUser().then(({ data: result }) => {
+      setUserId(result.user?.id || null); setAuthReady(true);
+      // Google sign-in returns tokens in the URL hash; drop them so they can't be copied or shared by accident.
+      if (location.hash.includes('access_token')) history.replaceState({}, '', location.pathname + location.search);
+    });
     const { data: listener } = client.auth.onAuthStateChange((event, session) => { setUserId(session?.user?.id || null); if (session?.user) setDemo(false); if (event === 'PASSWORD_RECOVERY') setAuthMode('update'); });
     return () => listener.subscription.unsubscribe();
   }, []);

@@ -11,4 +11,10 @@ export async function authorized(request: NextRequest): Promise<{ db: SupabaseCl
   if (error || !data.user) return NextResponse.json({ error: 'Bạn đã bị đăng xuất. Vui lòng đăng nhập lại.' }, { status: 401 });
   return { db, userId: data.user.id };
 }
-export function failure(error: unknown, status = 400) { return NextResponse.json({ error: error instanceof Error ? error.message : 'Có lỗi xảy ra.' }, { status }); }
+/** Database errors from Supabase are plain objects (not Error), so read their message too instead of hiding it. */
+export function failure(error: unknown, status = 400) {
+  const e = error as { message?: unknown; details?: unknown; hint?: unknown; code?: unknown } | null;
+  const message = e && typeof e.message === 'string' && e.message ? e.message : 'Có lỗi xảy ra.';
+  if (!(error instanceof Error)) console.error('[api]', error);
+  return NextResponse.json({ error: message, code: typeof e?.code === 'string' ? e.code : undefined }, { status });
+}

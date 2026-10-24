@@ -35,6 +35,9 @@ export type CardSeparator = 'newline' | 'semicolon' | 'custom';
 export type ImportOptions = { term: TermSeparator; card: CardSeparator; customTerm?: string; customCard?: string };
 
 /** Parse text pasted into the import box exactly like Quizlet: split into cards, then split each card once into term/definition. */
+/** Two or more spaces (incl. non-breaking and full-width Japanese spaces) between term and definition. */
+const SPACED_TAB = /[  　]{2,}/;
+
 export function parseImport(text: string, options: ImportOptions): { term: string; definition: string }[] {
   const source = text.replace(/^\uFEFF/, '').replace(/\r\n?/g, '\n');
   const unescape = (value = '') => value.replace(/\\n/g, '\n').replace(/\\t/g, '\t');
@@ -43,6 +46,10 @@ export function parseImport(text: string, options: ImportOptions): { term: strin
   if (!termSep || !cardSep) return [];
   return source.split(cardSep).filter(chunk => chunk.trim()).map(chunk => {
     const at = chunk.indexOf(termSep);
-    return at < 0 ? { term: chunk.trim(), definition: '' } : { term: chunk.slice(0, at).trim(), definition: chunk.slice(at + termSep.length).trim() };
+    if (at >= 0) return { term: chunk.slice(0, at).trim(), definition: chunk.slice(at + termSep.length).trim() };
+    // Copying from web pages or chats turns a Tab into several spaces; treat 2+ spaces as the Tab in that case.
+    const gap = options.term === 'tab' ? SPACED_TAB.exec(chunk) : null;
+    if (gap) return { term: chunk.slice(0, gap.index).trim(), definition: chunk.slice(gap.index + gap[0].length).trim() };
+    return { term: chunk.trim(), definition: '' };
   });
 }
