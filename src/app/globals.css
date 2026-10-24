@@ -435,7 +435,7 @@ kbd { font: 600 11px/1 ui-monospace, SFMono-Regular, Consolas, monospace; paddin
 .qz-banner { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 10px 10px 10px 16px; margin-bottom: 18px; border-radius: 12px; background: var(--t-blue); color: var(--t-blue-ink); font-weight: 600; font-size: 14px }
 .qz-meta { display: grid; gap: 18px; margin-bottom: 26px }
 .qz-field { display: flex; flex-direction: column; min-width: 0 }
-.qz-field textarea { width: 100%; min-height: 34px; padding: 6px 0 7px; resize: none; overflow: hidden; border: 0; border-bottom: 2px solid var(--ink-2); background: transparent; color: var(--ink); font-size: 16px; line-height: 1.45; outline: 0; border-radius: 0; transition: border-color .15s }
+.qz-field textarea { field-sizing: content; width: 100%; min-height: 34px; padding: 6px 0 7px; resize: none; overflow: hidden; border: 0; border-bottom: 2px solid var(--ink-2); background: transparent; color: var(--ink); font-size: 16px; line-height: 1.45; outline: 0; border-radius: 0; transition: border-color .15s }
 .qz-field textarea::placeholder { color: var(--muted); opacity: .7 }
 .qz-field textarea:focus { border-bottom-color: var(--primary); box-shadow: none }
 .qz-field textarea:disabled { border-bottom-style: dashed; opacity: .7; cursor: not-allowed }

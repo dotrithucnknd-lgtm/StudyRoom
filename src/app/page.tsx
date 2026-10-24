@@ -6,6 +6,7 @@ import { Button } from '@/components/ui/button';
 import { SetEditor, newEditorCard, type EditorCard } from '@/components/SetEditor';
 import { supabase, configured, googleEnabled } from '@/lib/supabase';
 import { demoData } from '@/lib/demo';
+import { CARD_BATCH } from '@/lib/limits';
 import { normalizeAnswer, scheduleReview, shuffle, type Rating } from '@/lib/study';
 import type { AppData, Card, CardDraft, SetDraft, SetRecord, Session, Progress, Folder } from '@/lib/types';
 import { ArrowLeftRight, ArrowRight, BookOpen, Brain, ChartNoAxesColumn, Check, ChevronLeft, ChevronRight, Clock3, Copy, Download, Eye, EyeOff, FileUp, Flame, FolderOpen, Gamepad2, Globe2, GraduationCap, Heart, House, Layers3, LibraryBig, LogOut, Maximize2, Moon, Pencil, Play, Plus, RotateCcw, Save, Search, Settings2, Shuffle, Star, Sun, Target, Trash2, Trophy, Users, Volume2, X } from 'lucide-react';
@@ -17,8 +18,6 @@ const emptySet: SetDraft = { title: '', description: '', source_language: 'Engli
 const cardFields = ['term', 'definition', 'phonetic', 'example', 'example_translation', 'notes', 'synonyms', 'antonyms'] as const;
 const pickCard = (c: CardDraft): CardDraft => Object.fromEntries(cardFields.map(f => [f, c[f] ?? ''])) as CardDraft;
 const toSetDraft = (s: SetRecord): SetDraft => ({ title: s.title, description: s.description || '', source_language: s.source_language, target_language: s.target_language, visibility: s.visibility, tags: s.tags || [], cover_color: s.cover_color || 'violet', folder_id: s.folder_id });
-/** Run async jobs with bounded concurrency so large edits don't flood the API. */
-async function runLimited(jobs: (() => Promise<unknown>)[], limit = 6) { let next = 0; await Promise.all(Array.from({ length: Math.min(limit, jobs.length) }, async () => { while (next < jobs.length) await jobs[next++](); })); }
 type Tone = 'violet' | 'green' | 'amber' | 'blue' | 'pink';
 const modes: { id: View; name: string; desc: string; icon: typeof Layers3; tone: Tone }[] = [
   { id: 'flashcards', name: 'Thẻ ghi nhớ', desc: 'Lật thẻ để ghi nhớ', icon: Layers3, tone: 'violet' },
@@ -58,6 +57,7 @@ export default function Page() {
   const [modal, setModal] = useState<'folder' | 'share' | null>(null);
   const [editor, setEditor] = useState<EditorState | null>(null);
   const [editorSaving, setEditorSaving] = useState(false);
+  const [saveProgress, setSaveProgress] = useState('');
   const editorDirty = useRef(false);
   const [folderName, setFolderName] = useState('');
   const [editingFolder, setEditingFolder] = useState<string | null>(null);
@@ -209,7 +209,13 @@ export default function Page() {
           const saved: SetRecord = await api('sets', 'POST', draft);
           setId = saved.id;
           const added: Card[] = [];
-          for (let i = 0; i < rows.length; i += 500) added.push(...await api('cards', 'POST', rows.slice(i, i + 500).map((r, j) => fresh(r, setId, i + j))));
+          try {
+            for (let i = 0; i < rows.length; i += CARD_BATCH) { setSaveProgress(`Đang lưu ${i}/${rows.length} thẻ…`); added.push(...await api('cards', 'POST', rows.slice(i, i + CARD_BATCH).map((r, j) => fresh(r, setId, i + j)))); }
+          } catch (e) {
+            // Roll back the half-created set so retrying doesn't leave duplicates behind.
+            await api(`sets?id=${setId}`, 'DELETE').catch(() => undefined);
+            throw e;
+          }
           updateData(d => ({ ...d, sets: [{ ...saved, card_count: added.length, access_role: 'owner' }, ...d.sets], cards: [...d.cards, ...added] }));
           setOverview(o => ({ ...o, cards: o.cards + added.length }));
         }
@@ -229,9 +235,11 @@ export default function Page() {
           updateData(d => ({ ...d, sets: d.sets.map(bump), cards: [...d.cards.filter(c => c.set_id !== setId), ...rows.map((r, i): Card => r.id ? { ...original.get(r.id)!, ...pickCard(r), position: i } : { ...fresh(r, setId, i), id: crypto.randomUUID() })] }));
         } else {
           if (metaChanged) await api('sets', 'PATCH', { ...draft, id: setId });
-          await runLimited(removed.map(c => () => api(`cards?id=${c.id}`, 'DELETE')));
-          await runLimited(changed.map(({ r, i }) => () => api('cards', 'PATCH', { ...pickCard(r), id: r.id, position: i })));
-          for (let k = 0; k < created.length; k += 500) await api('cards', 'POST', created.slice(k, k + 500).map(({ r, i }) => fresh(r, setId, i)));
+          const steps = removed.length + changed.length + created.length; let done = 0;
+          const progress = (n: number) => { done += n; setSaveProgress(`Đang lưu ${done}/${steps} thay đổi…`); };
+          for (let k = 0; k < removed.length; k += CARD_BATCH) { const ids = removed.slice(k, k + CARD_BATCH).map(c => c.id); await api('cards', 'DELETE', { ids }); progress(ids.length); }
+          for (let k = 0; k < changed.length; k += CARD_BATCH) { const part = changed.slice(k, k + CARD_BATCH); await api('cards', 'PATCH', part.map(({ r, i }) => ({ ...pickCard(r), id: r.id, position: i }))); progress(part.length); }
+          for (let k = 0; k < created.length; k += CARD_BATCH) { const part = created.slice(k, k + CARD_BATCH); await api('cards', 'POST', part.map(({ r, i }) => fresh(r, setId, i))); progress(part.length); }
           updateData(d => ({ ...d, sets: d.sets.map(bump) }));
           setSharedSets(list => list.map(bump)); setDiscoveredSets(list => list.map(bump));
           if (ownsSet) setOverview(o => ({ ...o, cards: Math.max(0, o.cards + created.length - removed.length) }));
@@ -247,7 +255,7 @@ export default function Page() {
       toast(`Không lưu được: ${(e as Error).message}`);
       if (!demo && editor.mode === 'edit' && editor.setId) void loadCards(editor.setId, 0);
       return false;
-    } finally { setEditorSaving(false); }
+    } finally { setEditorSaving(false); setSaveProgress(''); }
   }
   function openFolderForm(folder?: Folder) { setEditingFolder(folder?.id || null); setFolderName(folder?.name || ''); setModal('folder'); }
   async function openShareForm() { if (!activeSet || !ownsActiveSet || demo) return; setShareEmail(''); setShareRole('viewer'); setShareLink(''); setModal('share'); try { setShareInvites(await api(`shares?set=${activeSet.id}`)); } catch (e) { toast((e as Error).message); } }
@@ -435,7 +443,7 @@ export default function Page() {
         {view === 'shared' && <SharedPanel sets={sharedSets} total={sharedTotal} onOpen={openSet} onMore={() => loadShared(sharedPage + 1)} />}
         {view === 'discover' && <DiscoverPanel searchBox={searchBox} sets={discoveredSets} total={discoveredTotal} onOpen={openSet} onMore={() => loadDiscover(discoveredPage + 1, search)} onCreate={() => openEditor()} />}
 
-        {view === 'editor' && editor && <SetEditor key={editor.setId || 'new'} mode={editor.mode} initialSet={editor.set} initialCards={editor.cards} canEditMeta={editor.mode === 'create' || demo || (data.sets.find(s => s.id === editor.setId) || sharedSets.find(s => s.id === editor.setId) || discoveredSets.find(s => s.id === editor.setId))?.owner_id === userId} folders={data.folders || []} focusKey={editor.focusKey} openImport={editor.openImport} saving={editorSaving} onCancel={closeEditor} onSave={saveEditor} onDirtyChange={dirty => { editorDirty.current = dirty; }} notify={toast} />}
+        {view === 'editor' && editor && <SetEditor key={editor.setId || 'new'} mode={editor.mode} initialSet={editor.set} initialCards={editor.cards} canEditMeta={editor.mode === 'create' || demo || (data.sets.find(s => s.id === editor.setId) || sharedSets.find(s => s.id === editor.setId) || discoveredSets.find(s => s.id === editor.setId))?.owner_id === userId} folders={data.folders || []} focusKey={editor.focusKey} openImport={editor.openImport} saving={editorSaving} savingLabel={saveProgress} onCancel={closeEditor} onSave={saveEditor} onDirtyChange={dirty => { editorDirty.current = dirty; }} notify={toast} />}
 
         {view === 'set' && activeSet && <>
           <button className="btn ghost small back-link" onClick={() => go(setBackView)}><ChevronLeft /> {setBackView === 'library' ? 'Thư viện' : setBackView === 'shared' ? 'Được chia sẻ' : 'Khám phá'}</button>
