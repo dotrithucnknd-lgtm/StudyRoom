@@ -1,29 +1,35 @@
 ﻿'use client';
-import { useCallback, useEffect, useMemo, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { motion, AnimatePresence } from 'framer-motion';
 import { ResponsiveContainer, BarChart, Bar, XAxis, Tooltip } from 'recharts';
 import { Button } from '@/components/ui/button';
-import { parseDelimited, parseQuizletPaste, type PasteSeparator } from '@/lib/import';
+import { SetEditor, newEditorCard, type EditorCard } from '@/components/SetEditor';
 import { supabase, configured, googleEnabled } from '@/lib/supabase';
 import { demoData } from '@/lib/demo';
 import { normalizeAnswer, scheduleReview, shuffle, type Rating } from '@/lib/study';
-import type { AppData, Card, SetRecord, Session, Progress, Folder } from '@/lib/types';
-import { BookOpen, Brain, ChartNoAxesColumn, Check, ChevronLeft, ChevronRight, CircleHelp, Clock3, Cloud, Download, FileUp, Flame, FolderOpen, Gamepad2, Globe2, GraduationCap, Heart, Layers3, LogOut, Moon, MoreHorizontal, Pencil, Play, Plus, RotateCcw, Search, Settings2, Shuffle, Sparkles, Sun, Target, Trash2, Volume2, X, Zap, LibraryBig, ListFilter, Copy, Save, ArrowRight, UploadCloud, Trophy, LockKeyhole, Menu } from 'lucide-react';
+import type { AppData, Card, CardDraft, SetDraft, SetRecord, Session, Progress, Folder } from '@/lib/types';
+import { ArrowLeftRight, ArrowRight, BookOpen, Brain, ChartNoAxesColumn, Check, ChevronLeft, ChevronRight, Clock3, Copy, Download, Eye, EyeOff, FileUp, Flame, FolderOpen, Gamepad2, Globe2, GraduationCap, Heart, House, Layers3, LibraryBig, LogOut, Maximize2, Moon, Pencil, Play, Plus, RotateCcw, Save, Search, Settings2, Shuffle, Star, Sun, Target, Trash2, Trophy, Users, Volume2, X } from 'lucide-react';
 
-type View = 'dashboard' | 'library' | 'shared' | 'discover' | 'set' | 'flashcards' | 'learn' | 'match' | 'test' | 'review' | 'stats' | 'settings' | 'import';
+type View = 'dashboard' | 'library' | 'shared' | 'discover' | 'set' | 'flashcards' | 'learn' | 'match' | 'test' | 'review' | 'stats' | 'settings' | 'editor';
 type ShareInvite = { token: string; email: string; role: 'editor' | 'viewer'; accepted_user_id: string | null; accepted_at: string | null; expires_at: string; created_at: string };
-type SetDraft = Pick<SetRecord, 'title' | 'description' | 'source_language' | 'target_language' | 'visibility' | 'tags' | 'cover_color' | 'folder_id'>;
-type CardDraft = Pick<Card, 'term' | 'definition' | 'phonetic' | 'example' | 'example_translation' | 'notes' | 'synonyms' | 'antonyms'>;
+type EditorState = { mode: 'create' | 'edit'; setId: string | null; set: SetDraft; cards: EditorCard[]; original: Card[]; focusKey: string | null; openImport: boolean; returnTo: View };
 const emptySet: SetDraft = { title: '', description: '', source_language: 'English', target_language: 'Tiếng Việt', visibility: 'private', tags: [], cover_color: 'violet', folder_id: null };
-const emptyCard: CardDraft = { term: '', definition: '', phonetic: '', example: '', example_translation: '', notes: '', synonyms: '', antonyms: '' };
-const modes = [
-  { id: 'flashcards' as View, name: 'Flashcards', desc: 'Lật thẻ để ghi nhớ', icon: Layers3, bg: '#eeeaff', color: '#6958e8' },
-  { id: 'learn' as View, name: 'Học tập', desc: 'Chọn, gõ và học lại từ sai', icon: Brain, bg: '#e3f5ed', color: '#39a980' },
-  { id: 'match' as View, name: 'Nối từ', desc: 'Ghép cặp thật nhanh', icon: Gamepad2, bg: '#fff0e5', color: '#e49554' },
-  { id: 'test' as View, name: 'Kiểm tra', desc: 'Thử sức kiến thức', icon: GraduationCap, bg: '#e7efff', color: '#5c8ee4' },
-  { id: 'review' as View, name: 'Ôn tập', desc: 'Nhắc lại đúng lúc', icon: RotateCcw, bg: '#ffe9ef', color: '#df6d94' },
+const cardFields = ['term', 'definition', 'phonetic', 'example', 'example_translation', 'notes', 'synonyms', 'antonyms'] as const;
+const pickCard = (c: CardDraft): CardDraft => Object.fromEntries(cardFields.map(f => [f, c[f] ?? ''])) as CardDraft;
+const toSetDraft = (s: SetRecord): SetDraft => ({ title: s.title, description: s.description || '', source_language: s.source_language, target_language: s.target_language, visibility: s.visibility, tags: s.tags || [], cover_color: s.cover_color || 'violet', folder_id: s.folder_id });
+/** Run async jobs with bounded concurrency so large edits don't flood the API. */
+async function runLimited(jobs: (() => Promise<unknown>)[], limit = 6) { let next = 0; await Promise.all(Array.from({ length: Math.min(limit, jobs.length) }, async () => { while (next < jobs.length) await jobs[next++](); })); }
+type Tone = 'violet' | 'green' | 'amber' | 'blue' | 'pink';
+const modes: { id: View; name: string; desc: string; icon: typeof Layers3; tone: Tone }[] = [
+  { id: 'flashcards', name: 'Thẻ ghi nhớ', desc: 'Lật thẻ để ghi nhớ', icon: Layers3, tone: 'violet' },
+  { id: 'learn', name: 'Học', desc: 'Chọn, gõ và học lại từ sai', icon: Brain, tone: 'green' },
+  { id: 'test', name: 'Kiểm tra', desc: 'Thử sức kiến thức', icon: GraduationCap, tone: 'blue' },
+  { id: 'match', name: 'Ghép thẻ', desc: 'Ghép cặp thật nhanh', icon: Gamepad2, tone: 'amber' },
+  { id: 'review', name: 'Ôn tập', desc: 'Ôn từ sắp quên', icon: RotateCcw, tone: 'pink' },
 ];
-const nav = [ { id: 'dashboard' as View, name: 'Tổng quan', icon: ChartNoAxesColumn }, { id: 'library' as View, name: 'Thư viện của tôi', icon: LibraryBig }, { id: 'shared' as View, name: 'Được chia sẻ', icon: Globe2 }, { id: 'review' as View, name: 'Ôn tập hôm nay', icon: RotateCcw }, { id: 'stats' as View, name: 'Thống kê', icon: ChartNoAxesColumn } ];
+const studyViews: View[] = ['flashcards', 'learn', 'match', 'test', 'review'];
+const nav = [ { id: 'dashboard' as View, name: 'Trang chủ', icon: House }, { id: 'library' as View, name: 'Thư viện', icon: LibraryBig }, { id: 'shared' as View, name: 'Được chia sẻ', icon: Users }, { id: 'review' as View, name: 'Ôn tập hôm nay', icon: RotateCcw }, { id: 'stats' as View, name: 'Thống kê', icon: ChartNoAxesColumn } ];
+const headerNav = [nav[0], nav[1], { ...nav[3], name: 'Ôn tập' }, { id: 'discover' as View, name: 'Khám phá', icon: Globe2 }, nav[2], nav[4]];
 function formatDate(value: string) { return new Intl.DateTimeFormat('vi-VN', { day: '2-digit', month: '2-digit' }).format(new Date(value)); }
 function pronounce(text: string, language = 'English') { if (!('speechSynthesis' in window)) return false; speechSynthesis.cancel(); const u = new SpeechSynthesisUtterance(text); u.lang = language.includes('日本') || language.toLowerCase().includes('japan') ? 'ja-JP' : language.toLowerCase().includes('chinese') ? 'zh-CN' : 'en-US'; u.rate = .88; speechSynthesis.speak(u); return true; }
 function download(name: string, content: string, mime: string) { const blob = new Blob(['\uFEFF', content], { type: mime }); const url = URL.createObjectURL(blob); const a = document.createElement('a'); a.href = url; a.download = name; a.click(); URL.revokeObjectURL(url); }
@@ -49,11 +55,10 @@ export default function Page() {
   const [loading, setLoading] = useState(false);
   const [dark, setDark] = useState(false);
   const [search, setSearch] = useState('');
-  const [modal, setModal] = useState<'set' | 'card' | 'folder' | 'share' | null>(null);
-  const [editingSet, setEditingSet] = useState<string | null>(null);
-  const [editingCard, setEditingCard] = useState<string | null>(null);
-  const [setDraft, setSetDraft] = useState<SetDraft>(emptySet);
-  const [cardDraft, setCardDraft] = useState<CardDraft>(emptyCard);
+  const [modal, setModal] = useState<'folder' | 'share' | null>(null);
+  const [editor, setEditor] = useState<EditorState | null>(null);
+  const [editorSaving, setEditorSaving] = useState(false);
+  const editorDirty = useRef(false);
   const [folderName, setFolderName] = useState('');
   const [editingFolder, setEditingFolder] = useState<string | null>(null);
   const [folderFilter, setFolderFilter] = useState<string>('all');
@@ -92,11 +97,6 @@ export default function Page() {
   const [testType, setTestType] = useState<'typing' | 'multiple'>('typing');
   const [testNumber, setTestNumber] = useState(10);
   const [testChoices, setTestChoices] = useState<Record<string, string[]>>({});
-  const [importText, setImportText] = useState('');
-  const [importRows, setImportRows] = useState<CardDraft[]>([]);
-  const [importError, setImportError] = useState('');
-  const [importSeparator, setImportSeparator] = useState<PasteSeparator>('auto');
-  const [importBusy, setImportBusy] = useState(false);
   const [profileName, setProfileName] = useState('');
   const [dailyGoal, setDailyGoal] = useState(20);
   const [learningLanguage, setLearningLanguage] = useState('English');
@@ -127,7 +127,7 @@ export default function Page() {
   const goal = data.profile?.daily_goal || 20;
 
   useEffect(() => {
-    setDark(localStorage.getItem('lexora-theme') === 'dark');
+    setDark((localStorage.getItem('vanlet-theme') || localStorage.getItem('lexora-theme')) === 'dark');
     if (new URLSearchParams(location.search).get('demo') === '1') setDemo(true);
     const client = supabase();
     if (!client) { setAuthReady(true); return; }
@@ -136,10 +136,10 @@ export default function Page() {
     const { data: listener } = client.auth.onAuthStateChange((event, session) => { setUserId(session?.user?.id || null); if (session?.user) setDemo(false); if (event === 'PASSWORD_RECOVERY') setAuthMode('update'); });
     return () => listener.subscription.unsubscribe();
   }, []);
-  useEffect(() => { document.documentElement.classList.toggle('dark', dark); localStorage.setItem('lexora-theme', dark ? 'dark' : 'light'); }, [dark]);
+  useEffect(() => { document.documentElement.classList.toggle('dark', dark); localStorage.setItem('vanlet-theme', dark ? 'dark' : 'light'); }, [dark]);
   useEffect(() => { if (view !== 'match' || matched.length === matchTerms.length) return; const timer = setInterval(() => setElapsed(Math.floor((Date.now() - studyStart) / 1000)), 1000); return () => clearInterval(timer); }, [view, studyStart, matched.length, matchTerms.length]);
-  useEffect(() => { if (!demo) return; const saved = localStorage.getItem('lexora-demo'); try { setData(saved ? JSON.parse(saved) : structuredClone(demoData)); } catch { setData(structuredClone(demoData)); } }, [demo]);
-  useEffect(() => { if (demo && data.profile) localStorage.setItem('lexora-demo', JSON.stringify(data)); }, [data, demo]);
+  useEffect(() => { if (!demo) return; const saved = localStorage.getItem('vanlet-demo') || localStorage.getItem('lexora-demo'); try { setData(saved ? JSON.parse(saved) : structuredClone(demoData)); } catch { setData(structuredClone(demoData)); } }, [demo]);
+  useEffect(() => { if (demo && data.profile) localStorage.setItem('vanlet-demo', JSON.stringify(data)); }, [data, demo]);
 
   const api = useCallback(async (path: string, method = 'GET', body?: unknown) => {
     const token = (await supabase()?.auth.getSession())?.data.session?.access_token;
@@ -172,20 +172,83 @@ export default function Page() {
   useEffect(() => { if (!userId || demo) return; const id = new URLSearchParams(location.search).get('set'); if (!id) return; api(`sets?id=${encodeURIComponent(id)}`).then(result => { const set = result.sets?.[0]; if (!set) throw new Error('Bộ từ không tồn tại hoặc bạn không có quyền xem.'); setDiscoveredSets(old => old.some(s => s.id === set.id) ? old : [set, ...old]); setSelectedId(set.id); setView('set'); loadCards(set.id); history.replaceState({}, '', '/'); }).catch(e => toast((e as Error).message)); }, [userId, demo]);
   useEffect(() => { if (!userId || demo) return; const token = new URLSearchParams(location.search).get('invite'); if (!token) return; api('shares', 'PATCH', { token }).then(async result => { const sets = await api(`sets?id=${result.set_id}`); const set = sets.sets?.[0]; if (!set) throw new Error('Không thể mở bộ từ vừa được chia sẻ.'); setSharedSets(old => old.some(s => s.id === set.id) ? old : [set, ...old]); setSelectedId(set.id); setView('set'); loadCards(set.id); history.replaceState({}, '', '/'); toast('Đã nhận lời mời chia sẻ.'); }).catch(e => toast((e as Error).message)); }, [userId, demo]);
   useEffect(() => { if (demo && data.profile) { setProfileName(data.profile.display_name); setDailyGoal(data.profile.daily_goal); setLearningLanguage(data.profile.learning_language); } }, [demo, data.profile]);
-  function openSet(id: string) { setSelectedId(id); setView('set'); setSearch(''); setCardPage(0); if (!demo) loadCards(id); }
-  function navTo(next: View) { setView(next); if (next === 'review') beginMode('review', true); }
+  /** Leaving the editor with unsaved edits to an existing set needs confirmation; new-set drafts are autosaved. */
+  function canLeaveEditor() { if (view !== 'editor' || !editorDirty.current || editor?.mode === 'create') return true; if (!confirm('Bỏ các thay đổi chưa lưu?')) return false; editorDirty.current = false; return true; }
+  function go(next: View) { if (!canLeaveEditor()) return false; setView(next); return true; }
+  function openSet(id: string) { if (!canLeaveEditor()) return; setSelectedId(id); setView('set'); setSearch(''); setCardPage(0); if (!demo) loadCards(id); }
+  function navTo(next: View) { if (!go(next)) return; if (next === 'review') beginMode('review', true); }
   function updateData(mutator: (old: AppData) => AppData) { setData(mutator); }
-  async function saveSet() {
-    if (!setDraft.title.trim()) return toast('Hãy nhập tên bộ từ.');
-    try {
-      if (demo) {
-        if (editingSet) updateData(d => ({ ...d, sets: d.sets.map(s => s.id === editingSet ? { ...s, ...setDraft, updated_at: new Date().toISOString() } : s) }));
-        else { const id = crypto.randomUUID(); updateData(d => ({ ...d, sets: [{ ...setDraft, id, owner_id: 'demo', created_at: new Date().toISOString(), updated_at: new Date().toISOString(), card_count: 0 }, ...d.sets] })); setSelectedId(id); setView('set'); }
-      } else { const saved = await api('sets', editingSet ? 'PATCH' : 'POST', editingSet ? { ...setDraft, id: editingSet } : setDraft); updateData(d => ({ ...d, sets: editingSet ? d.sets.map(s => s.id === editingSet ? { ...s, ...saved } : s) : [saved, ...d.sets] })); if (!editingSet) { setSelectedId(saved.id); setView('set'); } }
-      setModal(null); toast(editingSet ? 'Đã cập nhật bộ từ.' : 'Đã tạo bộ từ mới.');
-    } catch (e) { toast((e as Error).message); }
+  /** Open the Quizlet-style editor: without a set it creates one; `focus` is a card id or 'new' to append a blank card. */
+  async function openEditor(set?: SetRecord, options: { focus?: string; importing?: boolean } = {}) {
+    if (!canLeaveEditor()) return;
+    editorDirty.current = false;
+    if (!set) { setEditor({ mode: 'create', setId: null, set: { ...emptySet, folder_id: folderFilter === 'all' ? null : folderFilter }, cards: [], original: [], focusKey: null, openImport: Boolean(options.importing), returnTo: view === 'editor' ? 'library' : view }); setView('editor'); return; }
+    let source = data.cards.filter(c => c.set_id === set.id);
+    if (!demo && (set.card_count || 0) > source.length) { setLoading(true); try { source = await fetchAllCards(set.id); } catch (e) { toast((e as Error).message); return; } finally { setLoading(false); } }
+    source = [...source].sort((a, b) => a.position - b.position);
+    const rows: EditorCard[] = source.map(c => ({ ...pickCard(c), key: c.id, id: c.id }));
+    let focusKey = options.focus || null;
+    if (options.focus === 'new') { const blank = newEditorCard(); rows.push(blank); focusKey = blank.key; }
+    setEditor({ mode: 'edit', setId: set.id, set: toSetDraft(set), cards: rows, original: source, focusKey, openImport: Boolean(options.importing), returnTo: 'set' });
+    setView('editor');
   }
-  function openSetForm(set?: SetRecord) { setEditingSet(set?.id || null); setSetDraft(set ? { title: set.title, description: set.description, source_language: set.source_language, target_language: set.target_language, visibility: set.visibility, tags: set.tags || [], cover_color: set.cover_color, folder_id: set.folder_id } : { ...emptySet, folder_id: folderFilter === 'all' ? null : folderFilter }); setModal('set'); }
+  function closeEditor() { editorDirty.current = false; const back = editor?.returnTo || 'library'; setEditor(null); setView(back === 'set' && !selectedId ? 'library' : back); }
+  async function saveEditor(draft: SetDraft, rows: EditorCard[]): Promise<boolean> {
+    if (!editor) return false;
+    setEditorSaving(true);
+    const now = new Date().toISOString();
+    const fresh = (r: EditorCard, setId: string, position: number) => ({ ...pickCard(r), set_id: setId, tags: [] as string[], favorite: false, difficult: false, mastered: false, position });
+    try {
+      let setId: string;
+      if (editor.mode === 'create') {
+        if (demo) {
+          setId = crypto.randomUUID();
+          const cards = rows.map((r, i): Card => ({ ...fresh(r, setId, i), id: crypto.randomUUID() }));
+          updateData(d => ({ ...d, sets: [{ ...draft, id: setId, owner_id: 'demo', created_at: now, updated_at: now, card_count: cards.length }, ...d.sets], cards: [...d.cards, ...cards] }));
+        } else {
+          const saved: SetRecord = await api('sets', 'POST', draft);
+          setId = saved.id;
+          const added: Card[] = [];
+          for (let i = 0; i < rows.length; i += 500) added.push(...await api('cards', 'POST', rows.slice(i, i + 500).map((r, j) => fresh(r, setId, i + j))));
+          updateData(d => ({ ...d, sets: [{ ...saved, card_count: added.length, access_role: 'owner' }, ...d.sets], cards: [...d.cards, ...added] }));
+          setOverview(o => ({ ...o, cards: o.cards + added.length }));
+        }
+        setCardTotal(rows.length);
+      } else {
+        setId = editor.setId!;
+        const record = data.sets.find(s => s.id === setId) || sharedSets.find(s => s.id === setId) || discoveredSets.find(s => s.id === setId);
+        const ownsSet = demo || record?.owner_id === userId;
+        const original = new Map(editor.original.map(c => [c.id, c]));
+        const kept = new Set(rows.flatMap(r => r.id ? [r.id] : []));
+        const removed = editor.original.filter(c => !kept.has(c.id));
+        const changed = rows.flatMap((r, i) => { const before = r.id ? original.get(r.id) : undefined; return before && (before.position !== i || cardFields.some(f => (before[f] || '') !== (r[f] || ''))) ? [{ r, i }] : []; });
+        const created = rows.flatMap((r, i) => r.id ? [] : [{ r, i }]);
+        const metaChanged = ownsSet && record && JSON.stringify(toSetDraft(record)) !== JSON.stringify(draft);
+        const bump = (s: SetRecord) => s.id === setId ? { ...s, ...(ownsSet ? draft : {}), card_count: rows.length, updated_at: now } : s;
+        if (demo) {
+          updateData(d => ({ ...d, sets: d.sets.map(bump), cards: [...d.cards.filter(c => c.set_id !== setId), ...rows.map((r, i): Card => r.id ? { ...original.get(r.id)!, ...pickCard(r), position: i } : { ...fresh(r, setId, i), id: crypto.randomUUID() })] }));
+        } else {
+          if (metaChanged) await api('sets', 'PATCH', { ...draft, id: setId });
+          await runLimited(removed.map(c => () => api(`cards?id=${c.id}`, 'DELETE')));
+          await runLimited(changed.map(({ r, i }) => () => api('cards', 'PATCH', { ...pickCard(r), id: r.id, position: i })));
+          for (let k = 0; k < created.length; k += 500) await api('cards', 'POST', created.slice(k, k + 500).map(({ r, i }) => fresh(r, setId, i)));
+          updateData(d => ({ ...d, sets: d.sets.map(bump) }));
+          setSharedSets(list => list.map(bump)); setDiscoveredSets(list => list.map(bump));
+          if (ownsSet) setOverview(o => ({ ...o, cards: Math.max(0, o.cards + created.length - removed.length) }));
+          await loadCards(setId, 0);
+        }
+        setCardTotal(rows.length);
+      }
+      editorDirty.current = false;
+      toast(editor.mode === 'create' ? `Đã tạo bộ từ với ${rows.length} thẻ.` : 'Đã lưu bộ từ.');
+      setEditor(null); setSelectedId(setId); setCardPage(0); setView('set');
+      return true;
+    } catch (e) {
+      toast(`Không lưu được: ${(e as Error).message}`);
+      if (!demo && editor.mode === 'edit' && editor.setId) void loadCards(editor.setId, 0);
+      return false;
+    } finally { setEditorSaving(false); }
+  }
   function openFolderForm(folder?: Folder) { setEditingFolder(folder?.id || null); setFolderName(folder?.name || ''); setModal('folder'); }
   async function openShareForm() { if (!activeSet || !ownsActiveSet || demo) return; setShareEmail(''); setShareRole('viewer'); setShareLink(''); setModal('share'); try { setShareInvites(await api(`shares?set=${activeSet.id}`)); } catch (e) { toast((e as Error).message); } }
   async function createShareInvite() { if (!activeSet || !shareEmail.trim()) return toast('Hãy nhập email người nhận.'); try { const invite: ShareInvite = await api('shares', 'POST', { set_id: activeSet.id, email: shareEmail.trim(), role: shareRole }); setShareInvites(old => [invite, ...old.filter(item => item.email !== invite.email)]); const link = `${location.origin}/?invite=${invite.token}`; setShareLink(link); setShareEmail(''); toast('Đã tạo liên kết mời. Hãy sao chép và gửi cho người nhận.'); } catch (e) { toast((e as Error).message); } }
@@ -195,20 +258,6 @@ export default function Page() {
   async function deleteSet(set: SetRecord) {
     if (!confirm(`Xóa bộ “${set.title}” và toàn bộ thẻ? Thao tác này không thể hoàn tác.`)) return;
     try { if (!demo) await api(`sets?id=${set.id}`, 'DELETE'); updateData(d => ({ ...d, sets: d.sets.filter(s => s.id !== set.id), cards: d.cards.filter(c => c.set_id !== set.id) })); setSelectedId(null); setView('library'); toast('Đã xóa bộ từ.'); } catch (e) { toast((e as Error).message); }
-  }
-  function openCardForm(card?: Card) { setEditingCard(card?.id || null); setCardDraft(card ? { term: card.term, definition: card.definition, phonetic: card.phonetic, example: card.example, example_translation: card.example_translation, notes: card.notes, synonyms: card.synonyms, antonyms: card.antonyms } : emptyCard); setModal('card'); }
-  async function saveCard() {
-    if (!selectedId || !cardDraft.term.trim() || !cardDraft.definition.trim()) return toast('Cần nhập từ và nghĩa.');
-    try {
-      if (demo) {
-        if (editingCard) updateData(d => ({ ...d, cards: d.cards.map(c => c.id === editingCard ? { ...c, ...cardDraft } : c) }));
-        else updateData(d => ({ ...d, cards: [...d.cards, { ...cardDraft, id: crypto.randomUUID(), set_id: selectedId, tags: [], favorite: false, difficult: false, mastered: false, position: activeCards.length }], sets: d.sets.map(s => s.id === selectedId ? { ...s, card_count: (s.card_count || 0) + 1 } : s) }));
-      } else {
-        if (editingCard) { const saved = await api('cards', 'PATCH', { ...cardDraft, id: editingCard }); updateData(d => ({ ...d, cards: d.cards.map(c => c.id === editingCard ? { ...c, ...saved } : c) })); }
-        else { const saved = await api('cards', 'POST', { ...cardDraft, set_id: selectedId, tags: [], favorite: false, difficult: false, mastered: false, position: cardTotal }); updateData(d => ({ ...d, cards: [...d.cards, saved[0]], sets: d.sets.map(s => s.id === selectedId ? { ...s, card_count: (s.card_count || 0) + 1 } : s) })); setCardTotal(n => n + 1); setOverview(o => ({ ...o, cards: o.cards + 1 })); }
-      }
-      setModal(null); toast(editingCard ? 'Đã lưu thay đổi.' : 'Đã thêm thẻ mới.');
-    } catch (e) { toast((e as Error).message); }
   }
   async function deleteCard(card: Card) { if (!confirm(`Xóa thẻ “${card.term}”?`)) return; try { if (!demo) await api(`cards?id=${card.id}`, 'DELETE'); updateData(d => ({ ...d, cards: d.cards.filter(c => c.id !== card.id), sets: d.sets.map(s => s.id === card.set_id ? { ...s, card_count: Math.max(0, (s.card_count || 0) - 1) } : s) })); setCardTotal(n => Math.max(0, n - 1)); if (!demo) setOverview(o => ({ ...o, cards: Math.max(0, o.cards - 1), mastered: Math.max(0, o.mastered - Number(card.progress?.state === 'mastered')) })); toast('Đã xóa thẻ.'); } catch (e) { toast((e as Error).message); } }
   async function toggleCard(card: Card, field: 'favorite' | 'difficult' | 'mastered') { try { if (!demo) await api('cards', 'PATCH', { id: card.id, [field]: !card[field] }); updateData(d => ({ ...d, cards: d.cards.map(c => c.id === card.id ? { ...c, [field]: !card[field] } : c) })); } catch (e) { toast((e as Error).message); } }
@@ -275,123 +324,375 @@ export default function Page() {
   async function doAuth(e: React.FormEvent) { e.preventDefault(); const client = supabase(); if (!client) return; setLoading(true); try { if (authMode === 'signup') { const { error } = await client.auth.signUp({ email: authEmail, password: authPassword, options: { data: { display_name: authEmail.split('@')[0] } } }); if (error) throw error; toast('Kiểm tra email để xác nhận tài khoản.'); } else if (authMode === 'login') { const { error } = await client.auth.signInWithPassword({ email: authEmail, password: authPassword }); if (error) throw error; } else if (authMode === 'update') { const { error } = await client.auth.updateUser({ password: authPassword }); if (error) throw error; setAuthMode('login'); toast('Mật khẩu đã được cập nhật.'); } else { const { error } = await client.auth.resetPasswordForEmail(authEmail, { redirectTo: location.origin }); if (error) throw error; toast('Đã gửi email đặt lại mật khẩu.'); } } catch (e) { toast((e as Error).message); } finally { setLoading(false); } }
   async function signInGoogle() { const client = supabase(); if (!client) return; const { error } = await client.auth.signInWithOAuth({ provider: 'google', options: { redirectTo: location.href } }); if (error) toast(error.message); }
   async function signOut() { await supabase()?.auth.signOut(); setUserId(null); setDemo(false); setData({ sets: [], cards: [], sessions: [], profile: null }); setView('dashboard'); }
-  function previewImport(text: string, isJson = false, fromFile = false) { try { if (!text.trim()) throw new Error('Hãy dán ít nhất một cặp từ và nghĩa.'); const rows = isJson ? JSON.parse(text) : fromFile ? parseDelimited(text) : parseQuizletPaste(text, importSeparator); const cards: CardDraft[] = (Array.isArray(rows) ? rows : rows.cards).map((r: Record<string, unknown>) => { const map = Object.fromEntries(Object.entries(r).map(([k,v]) => [k.trim().toLowerCase(), v])); return { ...emptyCard, term: String(map.term || map.word || map['từ'] || '').trim(), definition: String(map.definition || map.meaning || map['nghĩa'] || '').trim(), phonetic: String(map.phonetic || map.ipa || map['phiên âm'] || ''), example: String(map.example || map['ví dụ'] || ''), example_translation: String(map.example_translation || ''), notes: String(map.notes || map['ghi chú'] || ''), synonyms: String(map.synonyms || ''), antonyms: String(map.antonyms || '') }; }); setImportRows(cards); setImportError(cards.some(r => !r.term || !r.definition) ? 'Một số dòng thiếu từ hoặc nghĩa. Những dòng này sẽ được bỏ qua.' : ''); } catch (error) { setImportRows([]); setImportError(error instanceof Error ? error.message : 'Không đọc được dữ liệu.'); } }
-  async function onImportFile(file: File) { if (file.size > 8 * 1024 * 1024) return setImportError('File vượt quá 8 MB. Hãy chia nhỏ file.'); if (/\.xlsx?$/i.test(file.name)) { try { const XLSX = await import('xlsx'); const workbook = XLSX.read(await file.arrayBuffer()); const rows = XLSX.utils.sheet_to_json<Record<string, string>>(workbook.Sheets[workbook.SheetNames[0]], { defval: '' }); previewImport(JSON.stringify(rows), true); setImportText(''); } catch { setImportError('Không đọc được file Excel.'); } } else { const text = await file.text(); setImportText(text); previewImport(text, file.name.toLowerCase().endsWith('.json'), true); } }
-  async function commitImport() {
-    if (!selectedId || importBusy) return;
-    setImportBusy(true);
-    try {
-      const existing = demo ? activeCards : cardTotal > activeCards.length ? await fetchAllCards(selectedId) : activeCards;
-      const seen = new Set(existing.map(c => normalizeAnswer(c.term)));
-      const valid = importRows.filter(r => {
-        const term = normalizeAnswer(r.term);
-        if (!r.term || !r.definition || seen.has(term)) return false;
-        seen.add(term);
-        return true;
-      });
-      if (!valid.length) return toast('Không có thẻ hợp lệ mới.');
-      let added: Card[] = [];
-      if (demo) added = valid.map((r, i) => ({ ...r, id: crypto.randomUUID(), set_id: selectedId, tags: [], favorite: false, difficult: false, mastered: false, position: existing.length + i }));
-      else for (let i = 0; i < valid.length; i += 500) {
-        const batch = valid.slice(i, i + 500).map((r, j) => ({ ...r, set_id: selectedId, tags: [], favorite: false, difficult: false, mastered: false, position: cardTotal + i + j }));
-        added.push(...await api('cards', 'POST', batch));
-      }
-      updateData(d => ({ ...d, cards: [...d.cards, ...added], sets: d.sets.map(s => s.id === selectedId ? { ...s, card_count: (s.card_count || 0) + added.length } : s) }));
-      setCardTotal(n => n + added.length);
-      if (!demo) setOverview(o => ({ ...o, cards: o.cards + added.length }));
-      setImportRows([]); setImportText(''); setView('set');
-      toast(`Đã nhập ${added.length} thẻ${valid.length < importRows.length ? `, bỏ qua ${importRows.length - valid.length} dòng trùng hoặc lỗi` : ''}.`);
-    } catch (e) {
-      toast(`Import dừng: ${(e as Error).message}. Các batch đã lưu vẫn còn trong bộ từ.`);
-      if (!demo) { await loadLive(); await loadCards(selectedId); }
-    } finally { setImportBusy(false); }
-  }
 
   const filteredSets = useMemo(() => data.sets.filter(s => (folderFilter === 'all' || s.folder_id === folderFilter) && `${s.title} ${s.description} ${(s.tags || []).join(' ')}`.toLowerCase().includes(search.toLowerCase())), [data.sets, search, folderFilter]);
   const activityByDay = useMemo(() => Array.from({ length: 7 }, (_, i) => { const date = new Date(); date.setDate(date.getDate() - (6 - i)); return { label: ['CN', 'T2', 'T3', 'T4', 'T5', 'T6', 'T7'][date.getDay()], value: data.sessions.filter(s => new Date(s.created_at).toDateString() === date.toDateString()).reduce((n, s) => n + s.total, 0) }; }), [data.sessions]);
 
-  if (!authReady) return <div className="auth-form-wrap" style={{ minHeight: '100vh' }}><div className="skeleton" style={{ width: 240, height: 24 }} /></div>;
-  if ((!userId && !demo) || authMode === 'update') return <div className="auth-shell"><div className="auth-visual"><div className="brand"><div className="brand-mark"><Layers3 size={22} /></div>LEXORA</div><div><span className="eyebrow">SMART VOCABULARY STUDIO</span><h1>Từ vựng ở lại.<br />Cảm hứng bắt đầu.</h1><p>Xây dựng bộ từ của riêng bạn, luyện tập theo nhiều cách và ghi nhớ lâu hơn mỗi ngày.</p><div className="hero-visual" style={{ position: 'relative', top: 20, right: 'auto', margin: 'auto' }}><div className="hero-card"><span /><span /><span /></div></div></div><div className="muted">Học theo nhịp của bạn. Tiến bộ theo cách của bạn.</div></div><div className="auth-form-wrap"><div className="auth-box"><div className="eyebrow">CHÀO MỪNG ĐẾN LEXORA</div><h1>{authMode === 'login' ? 'Đăng nhập' : authMode === 'signup' ? 'Tạo tài khoản' : authMode === 'update' ? 'Tạo mật khẩu mới' : 'Đặt lại mật khẩu'}</h1><p className="muted">{configured ? 'Đồng bộ bộ từ và tiến độ học tập trên mọi thiết bị.' : 'Chưa cấu hình Supabase. Bạn có thể xem bản demo trên thiết bị này.'}</p>{configured && <form onSubmit={doAuth}>{authMode !== 'update' && <label className="field"><span>Email</span><input className="input" type="email" required value={authEmail} onChange={e => setAuthEmail(e.target.value)} placeholder="you@example.com" /></label>}{authMode !== 'reset' && <label className="field"><span>Mật khẩu</span><input className="input" type="password" minLength={6} required value={authPassword} onChange={e => setAuthPassword(e.target.value)} placeholder="Ít nhất 6 ký tự" /></label>}<button className="btn primary" style={{ width: '100%' }} disabled={loading}>{loading ? 'Đang xử lý...' : authMode === 'login' ? 'Đăng nhập' : authMode === 'signup' ? 'Đăng ký' : authMode === 'update' ? 'Lưu mật khẩu mới' : 'Gửi email đặt lại'}</button><div className="between" style={{ marginTop: 16 }}><button type="button" className="btn ghost small" onClick={() => setAuthMode(authMode === 'signup' ? 'login' : 'signup')}>{authMode === 'signup' ? 'Đã có tài khoản?' : 'Tạo tài khoản'}</button><button type="button" className="btn ghost small" onClick={() => setAuthMode(authMode === 'reset' ? 'login' : 'reset')}>{authMode === 'reset' ? 'Quay lại' : 'Quên mật khẩu?'}</button></div></form>}{configured && googleEnabled && authMode !== 'reset' && authMode !== 'update' && <button className="btn" style={{ width: '100%', marginTop: 12 }} onClick={signInGoogle}><Globe2 /> Tiếp tục với Google</button>}{configured && <div style={{ textAlign: 'center', margin: '20px 0', color: 'var(--muted)' }}>hoặc</div>}<button className="btn soft" style={{ width: '100%' }} onClick={() => setDemo(true)}>Khám phá bản demo <ArrowRight size={15} /></button><p className="muted" style={{ fontSize: 12, marginTop: 14 }}>Bản demo lưu tạm trên trình duyệt này. Đăng nhập để đồng bộ lâu dài.</p></div></div>{message && <div className="toast">{message}</div>}</div>;
+  useEffect(() => { if (!modal) return; const onKey = (e: KeyboardEvent) => { if (e.key === 'Escape') setModal(null); }; window.addEventListener('keydown', onKey); return () => window.removeEventListener('keydown', onKey); }, [modal]);
 
-  return <div className="app">
-    <aside className="sidebar"><div className="brand"><div className="brand-mark"><Layers3 size={21} /></div>LEXORA</div><div className="side-label">KHÔNG GIAN HỌC</div>{nav.map(item => <button key={item.id} className={`nav-item ${view === item.id ? 'active' : ''}`} onClick={() => navTo(item.id)}><item.icon />{item.name}</button>)}<div className="side-label">KHÁM PHÁ</div><button className="nav-item" onClick={() => setView('discover')}><Globe2 />Bộ từ công khai</button><button className="nav-item" onClick={() => { setView('library'); openSetForm(); }}><Plus />Tạo bộ từ mới</button><button className="nav-item" onClick={() => setView('settings')}><Settings2 />Cài đặt</button><div className="nav-grow" /><div className="sidebar-bottom"><div className="goal-small"><div className="row"><Target size={16} /><strong>Mục tiêu hôm nay</strong></div><p style={{ fontSize: 11, margin: '8px 0' }}>{todayReviewed}/{goal} lượt học đã hoàn thành</p><div className="tiny-progress"><span style={{ width: `${Math.min(100, todayReviewed / goal * 100)}%` }} /></div></div><button className="nav-item" style={{ marginTop: 13 }} onClick={demo ? () => { setDemo(false); setData({ sets: [], cards: [], sessions: [], profile: null }); } : signOut}><LogOut />{demo ? 'Thoát demo' : 'Đăng xuất'}</button></div></aside>
-    <main className="main"><header className="topbar"><div className="search"><Search size={17} /><input aria-label="Tìm kiếm bộ từ" value={search} onChange={e => setSearch(e.target.value)} onFocus={() => { if (view !== 'library' && view !== 'discover') setView('library'); }} placeholder="Tìm bộ từ, chủ đề..." /></div><div className="top-actions">{demo && <span className="badge-demo">DEMO • CHỈ LƯU TRÊN MÁY NÀY</span>}<button className="icon-button" aria-label="Đổi giao diện" onClick={() => setDark(v => !v)}>{dark ? <Sun size={17} /> : <Moon size={17} />}</button><button className="avatar" aria-label="Cài đặt hồ sơ" onClick={() => setView('settings')}>{(data.profile?.display_name || 'L').charAt(0).toUpperCase()}</button></div></header>
-    <div className="content"><AnimatePresence mode="wait"><motion.div key={view + (selectedId || '')} initial={{ opacity: 1, y: 8 }} animate={{ opacity: 1, y: 0 }} exit={{ opacity: 0, y: -4 }} transition={{ duration: .18 }}>
-      {view === 'dashboard' && <><div className="welcome"><div className="eyebrow">KHÔNG GIAN HỌC CỦA BẠN</div><h1>Chào {data.profile?.display_name || 'bạn'}, hôm nay học gì nhỉ?</h1><p>Mỗi từ mới là một bước gần hơn đến mục tiêu của bạn.</p></div><div className="hero"><div style={{ zIndex: 1 }}><span className="eyebrow">TIẾP TỤC HÀNH TRÌNH</span><h2>Học đều một chút,<br />nhớ lâu hơn mỗi ngày.</h2><p>{dueCount ? `Bạn có ${dueCount} từ đến hạn ôn. Bắt đầu ngay để giữ vững kiến thức nhé.` : 'Dành vài phút để khám phá và ghi nhớ những từ mới hôm nay.'}</p><button className="btn primary" onClick={() => { beginMode('review', true); }}>Bắt đầu ôn tập <ArrowRight size={16} /></button></div><div className="hero-visual"><div className="hero-card"><span /><span /><span /></div></div></div><div className="stats-grid"><Stat icon={LibraryBig} label="Bộ từ của bạn" value={data.sets.length} caption="Sẵn sàng để học" tint="#eeeaff" color="#6a5be4" /><Stat icon={BookOpen} label="Tổng số từ" value={totalCards} caption="Trong thư viện" tint="#e8f5ef" color="#4da984" /><Stat icon={Check} label="Đã ghi nhớ" value={mastered} caption="Từ đã thuộc" tint="#e9f0ff" color="#5a8add" /><Stat icon={Clock3} label="Cần ôn hôm nay" value={dueCount} caption="Đúng thời điểm" tint="#fff0e5" color="#dd9252" /></div><div className="two-col"><section><div className="between section-heading"><div><h2>Hoạt động học tập</h2><span className="muted">7 ngày gần đây</span></div><button className="btn ghost small" onClick={() => setView('stats')}>Xem thống kê <ArrowRight /></button></div><div className="panel"><div className="between"><div><span className="muted">Lượt luyện tập</span><div className="stat-number">{activityByDay.reduce((n,d) => n + d.value,0)}</div></div><span className="pill">Tuần này</span></div><ActivityChart days={activityByDay} height={162} /></div></section><section><div className="section-heading"><h2>Mục tiêu hôm nay</h2><span className="muted">Một chút mỗi ngày, khác biệt lâu dài</span></div><div className="panel" style={{ minHeight: 239 }}><div className="between"><div className="mode-icon" style={{ background: '#eeeaff', color: '#6958e8', margin: 0 }}><Target size={22} /></div><span className="pill">{Math.min(100,Math.round(todayReviewed / goal * 100))}%</span></div><h3 style={{ margin: '15px 0 4px' }}>{todayReviewed} / {goal} lượt học</h3><p className="muted" style={{ fontSize: 12 }}>Tiến thêm một bước tới mục tiêu của bạn.</p><div className="progress-track"><span style={{ width: `${Math.min(100, todayReviewed / goal * 100)}%` }} /></div><div className="row" style={{ marginTop: 19, color: 'var(--muted)', fontSize: 12 }}><Clock3 size={15} /> {todayMinutes} phút học hôm nay</div></div></section></div><div className="between section-heading" style={{ marginTop: 32 }}><h2>Bộ từ của bạn</h2><button className="btn ghost small" onClick={() => setView('library')}>Xem tất cả <ArrowRight /></button></div>{data.sets.length ? <div className="set-grid">{data.sets.slice(0,3).map(s => <SetCard key={s.id} set={s} onClick={() => openSet(s.id)} />)}</div> : <Empty title="Bắt đầu bộ từ đầu tiên" text="Tạo bộ từ rồi thêm những từ bạn muốn ghi nhớ." action="Tạo bộ từ" onClick={() => openSetForm()} />}</>}
-      {view === 'library' && <><div className="between mobile-stack welcome"><div><div className="eyebrow">THƯ VIỆN CỦA TÔI</div><h1>Tất cả bộ từ</h1><p>Không gian lưu giữ những điều bạn đang học.</p></div><button className="btn primary" onClick={() => openSetForm()}><Plus /> Tạo bộ từ</button></div><FolderBar folders={data.folders || []} selected={folderFilter} onSelect={setFolderFilter} onAdd={() => openFolderForm()} onEdit={openFolderForm} onDelete={deleteFolder} /><div className="between" style={{ marginBottom: 19 }}><span className="muted">{filteredSets.length} bộ từ</span><span className="pill">{data.sets.reduce((n,s) => n + (s.card_count || data.cards.filter(c => c.set_id === s.id).length),0)} từ vựng</span></div>{loading ? <div className="set-grid">{[1,2,3].map(n => <div className="skeleton" key={n} style={{ height: 212 }} />)}</div> : filteredSets.length ? <div className="set-grid">{filteredSets.map(s => <SetCard key={s.id} set={s} onClick={() => openSet(s.id)} />)}</div> : <Empty title={search ? 'Không tìm thấy bộ từ' : 'Thư viện đang trống'} text={search ? 'Thử một từ khóa khác.' : 'Tạo bộ từ đầu tiên và bắt đầu hành trình.'} action={search ? 'Xóa tìm kiếm' : 'Tạo bộ từ'} onClick={() => search ? setSearch('') : openSetForm()} />}{!demo && !search && data.sets.length < setsTotal && <div style={{ textAlign: 'center', marginTop: 22 }}><button className="btn" onClick={loadMoreSets}>Tải thêm bộ từ <ChevronRight /></button></div>}</>}
-      {view === 'shared' && <SharedPanel sets={sharedSets} total={sharedTotal} onOpen={openSet} onMore={() => loadShared(sharedPage + 1)} />}
-      {view === 'discover' && <DiscoverPanel sets={discoveredSets} total={discoveredTotal} onOpen={openSet} onMore={() => loadDiscover(discoveredPage + 1, search)} onCreate={() => openSetForm()} />}
-      {view === 'set' && activeSet && <><button className="btn ghost small" style={{ marginBottom: 15 }} onClick={() => setView(ownsActiveSet ? 'library' : sharedSets.some(s => s.id === activeSet.id) ? 'shared' : 'discover')}><ChevronLeft /> {ownsActiveSet ? 'Thư viện' : sharedSets.some(s => s.id === activeSet.id) ? 'Được chia sẻ' : 'Khám phá'}</button><div className="between mobile-stack welcome"><div><div className="row" style={{ marginBottom: 10 }}><span className="pill">{activeSet.source_language} → {activeSet.target_language}</span><span className="muted" style={{ fontSize: 12 }}>{activeSet.visibility === 'public' ? 'Công khai' : 'Riêng tư'}</span></div><h1>{activeSet.title}</h1><p>{activeSet.description || 'Bộ từ của bạn, theo cách của bạn.'}</p></div><div className="row" style={{ flexWrap: 'wrap' }}><button className="btn" disabled={!ownsActiveSet} title={!ownsActiveSet ? 'Chỉ chủ sở hữu được chỉnh sửa' : undefined} onClick={() => openSetForm(activeSet)}><Pencil /> Chỉnh sửa</button>{ownsActiveSet && !demo && <button className="btn" onClick={openShareForm}><Globe2 /> Mời học cùng</button>}<button className="btn danger" disabled={!ownsActiveSet} onClick={() => deleteSet(activeSet)} aria-label="Xóa bộ từ"><Trash2 /></button></div></div><div className="between section-heading"><h2>Chọn cách học</h2><span className="muted">{demo ? activeCards.length : cardTotal} thẻ từ</span></div><div className="mode-grid" style={{ marginBottom: 31 }}>{modes.map(m => <button key={m.id} className="mode-card" onClick={() => beginMode(m.id)}><div className="mode-icon" style={{ background: m.bg, color: m.color }}><m.icon size={22} /></div><h3>{m.name}</h3><p>{m.desc}</p></button>)}</div><div className="between mobile-stack section-heading"><div><h2>Danh sách từ vựng</h2><span className="muted">Chỉnh sửa và tổ chức thẻ của bạn</span></div><div className="row" style={{ flexWrap: 'wrap' }}><button className="btn" disabled={!canEditActiveCards} onClick={() => setView('import')}><FileUp /> Nhập từ</button><button className="btn" onClick={() => exportSet(activeSet, 'csv')}><Download /> Xuất CSV</button><button className="btn primary" disabled={!canEditActiveCards} onClick={() => openCardForm()}><Plus /> Thêm từ</button></div></div>{activeCards.length ? <div className="panel table-scroll" style={{ padding: 0 }}><table className="card-table"><thead><tr><th style={{ width: '40%' }}>Từ / cụm từ</th><th>Nghĩa</th><th style={{ width: 132 }}>Thao tác</th></tr></thead><tbody>{activeCards.map(c => <tr key={c.id}><td><strong>{c.term}</strong><small>{c.phonetic}</small></td><td>{c.definition}</td><td><div className="row" style={{ gap: 5 }}><button className="icon-button" title="Yêu thích" disabled={!canEditActiveCards} onClick={() => toggleCard(c, 'favorite')} style={{ color: c.favorite ? '#e96d84' : undefined }}><Heart size={15} fill={c.favorite ? 'currentColor' : 'none'} /></button><button className="icon-button" title="Sửa" disabled={!canEditActiveCards} onClick={() => openCardForm(c)}><Pencil size={15} /></button><button className="icon-button" title="Xóa" disabled={!canEditActiveCards} onClick={() => deleteCard(c)}><Trash2 size={15} /></button></div></td></tr>)}</tbody></table></div> : <Empty title="Chưa có thẻ nào" text="Thêm từng từ hoặc nhập danh sách từ file." action="Thêm từ" onClick={() => openCardForm()} />}{!demo && cardTotal > 100 && <div className="row" style={{ justifyContent: 'center', marginTop: 20 }}><button className="btn" disabled={cardPage === 0} onClick={() => loadCards(activeSet.id, cardPage - 1)}>Trang trước</button><span className="muted">Trang {cardPage + 1}/{Math.ceil(cardTotal / 100)}</span><button className="btn" disabled={(cardPage + 1) * 100 >= cardTotal} onClick={() => loadCards(activeSet.id, cardPage + 1)}>Trang sau</button></div>}<div className="row" style={{ marginTop: 22, flexWrap: 'wrap' }}><button className="btn small" onClick={() => duplicateSet(activeSet)}><Copy /> Nhân bản</button><button className="btn small" onClick={() => exportSet(activeSet, 'tsv')}><Download /> TSV</button><button className="btn small" onClick={() => exportSet(activeSet, 'json')}><Download /> JSON</button>{activeSet.visibility === 'public' && <button className="btn small" onClick={async () => { try { await navigator.clipboard.writeText(`${location.origin}/?set=${activeSet.id}`); toast('Đã sao chép liên kết. Người xem cần đăng nhập.'); } catch { toast('Không thể sao chép liên kết.'); } }}><Globe2 /> Chia sẻ liên kết</button>}</div></>}
-      {view === 'import' && activeSet && <ImportPanel setTitle={activeSet.title} text={importText} separator={importSeparator} rows={importRows} error={importError} busy={importBusy} existing={activeCards} onBack={() => setView('set')} onText={value => { setImportText(value); setImportRows([]); setImportError(''); }} onSeparator={value => { setImportSeparator(value); setImportRows([]); }} onFile={onImportFile} onPreview={() => previewImport(importText, importText.trim().startsWith('{') || importText.trim().startsWith('['))} onCommit={commitImport} />}
-      {['flashcards','learn','match','test','review'].includes(view) && <div className="study-wrap"><div className="between study-top"><button className="btn ghost small" onClick={() => { if (selectedId) setView('set'); else setView('dashboard'); }}><X /> Thoát</button><span className="eyebrow">{modes.find(m => m.id === view)?.name}</span><span className="muted">{view === 'learn' ? `${learnMastered.length} / ${learnTotal} từ` : `${Math.min(index + 1, deck.length)} / ${deck.length}`}</span></div>{deck.length === 0 ? <Empty title="Chưa có từ để học" text="Thêm thẻ vào bộ từ hoặc đợi đến kỳ ôn tập tiếp theo." action="Về thư viện" onClick={() => setView('library')} /> : <>
-        {view === 'flashcards' && <><div className="between" style={{ marginBottom: 15 }}><select className="select" style={{ width: 180 }} value={filter} onChange={e => changeFilter(e.target.value as typeof filter)}><option value="all">Tất cả từ</option><option value="unmastered">Chưa thuộc</option><option value="difficult">Từ khó</option><option value="favorite">Yêu thích</option></select><button className="btn small" onClick={() => { setReverse(v => !v); setFlipped(false); }}>Đổi chiều thẻ</button></div><div className="flashcard" role="button" tabIndex={0} onClick={() => setFlipped(v => !v)} onKeyDown={e => e.key === 'Enter' && setFlipped(v => !v)}><div className="face-label">{flipped ? 'MẶT SAU' : 'MẶT TRƯỚC'}</div><div className="word">{flipped ? reverse ? deck[index]?.term : deck[index]?.definition : reverse ? deck[index]?.definition : deck[index]?.term}</div>{!flipped && showHints && <div className="phonetic">{reverse ? '' : deck[index]?.phonetic}</div>}{flipped && showHints && deck[index]?.example && <p className="muted" style={{ marginTop: 17 }}>{deck[index].example}</p>}<span className="muted" style={{ fontSize: 12, marginTop: 25 }}>Nhấn để lật thẻ · Space</span></div><div className="study-controls"><button className="btn" disabled={index === 0} onClick={previousCard}><ChevronLeft /> Trước</button><button className="btn" onClick={() => setDeck(shuffle(deck))}><Shuffle /> Xáo trộn</button><button className="btn" onClick={() => setShowHints(v => !v)}>{showHints ? 'Ẩn gợi ý' : 'Hiện gợi ý'}</button><button className="btn primary" onClick={async () => { if (index + 1 >= deck.length) { await saveSession('flashcards', correct, deck.length); toast('Hoàn thành lượt học!'); setView('set'); } else nextCard(); }}>Tiếp <ChevronRight /></button></div><div className="study-controls"><button className="btn small" onClick={() => { toggleCard(deck[index], 'difficult'); toast('Đã đánh dấu từ khó.'); }}>Từ khó</button><button className="btn small" onClick={() => { if (!deck[index].mastered) { toggleCard(deck[index], 'mastered'); setCorrect(n => n + 1); } }}>Đã thuộc</button><button className="btn small" onClick={() => { if (!pronounce(deck[index]?.term || '', activeSet?.source_language)) toast('Trình duyệt này không hỗ trợ phát âm.'); }}> <Volume2 /> Nghe</button></div></>}
-        {view === 'learn' && <LearnPanel card={deck[index]} stage={learnStages[deck[index]?.id] || (learnTotal < 2 ? 'typing' : 'choice')} options={learnOptions} choice={learnChoice} answer={answer} feedback={feedback} mastered={learnMastered.length} total={learnTotal} attempts={learnAttempts} onChoice={value => { void submitLearn(value); }} onAnswer={setAnswer} onSubmit={() => { void submitLearn(); }} onSkip={() => { void submitLearn('', true); }} onNext={advanceLearn} onRestart={() => beginMode('learn')} onBack={() => setView('set')} />}
-        {view === 'review' && <>{index >= deck.length ? <Result correct={correct} total={deck.length} onAgain={() => beginMode('review')} onBack={() => setView(selectedId ? 'set' : 'dashboard')} /> : <><div className="flashcard" onClick={() => setFlipped(v => !v)} role="button" tabIndex={0}><div className="face-label">{flipped ? 'NGHĨA' : 'BẠN CÒN NHỚ TỪ NÀY?'}</div><div className="word">{flipped ? deck[index].definition : deck[index].term}</div><p className="muted">{flipped ? deck[index].example : deck[index].phonetic}</p><span className="muted" style={{ fontSize: 12, marginTop: 20 }}>Nhấn để lật thẻ</span></div>{flipped && <div className="study-controls">{(['again','hard','good','easy'] as Rating[]).map((rating,i) => <button className={`btn ${i === 2 ? 'primary' : ''}`} key={rating} onClick={async () => { await rateCard(deck[index], rating); if (rating !== 'again') setCorrect(n => n + 1); if (index + 1 >= deck.length) { await saveSession('review', correct + Number(rating !== 'again'), deck.length); setIndex(deck.length); } else nextCard(); }}>{['Quên rồi','Khó','Nhớ','Dễ'][i]}</button>)}</div>}</>}</>}
-        {view === 'match' && <><div className="between" style={{ marginBottom: 18 }}><h2 style={{ margin: 0 }}>Ghép từ với nghĩa</h2><span className="pill">{matched.length}/{matchTerms.length} cặp · {Math.floor(elapsed / 60)}:{String(elapsed % 60).padStart(2, '0')}</span></div>{matched.length === matchTerms.length ? <Result correct={matched.length} total={matched.length} onAgain={() => beginMode('match')} onBack={() => setView('set')} /> : <div className="match-grid"><div>{matchTerms.map(c => <button key={c.id} className={`match-tile ${matched.includes(c.id) ? 'matched' : ''} ${matchSelection?.id === c.id && matchSelection.type === 'term' ? 'selected' : ''} ${wrongMatch && matchSelection?.id === c.id ? 'wrong' : ''}`} style={{ display: 'block', width: '100%', marginBottom: 12 }} onClick={() => chooseMatch('term', c.id)}>{c.term}</button>)}</div><div>{matchDefinitions.map(c => <button key={c.id} className={`match-tile ${matched.includes(c.id) ? 'matched' : ''} ${matchSelection?.id === c.id && matchSelection.type === 'definition' ? 'selected' : ''} ${wrongMatch && matchSelection?.id === c.id ? 'wrong' : ''}`} style={{ display: 'block', width: '100%', marginBottom: 12 }} onClick={() => chooseMatch('definition', c.id)}>{c.definition}</button>)}</div></div>}</>}
-        {view === 'test' && <>
-          {!testStarted ? <div className="panel" style={{ padding: 30 }}><div className="eyebrow">THIẾT LẬP BÀI KIỂM TRA</div><h2 style={{ marginTop: 12 }}>Bài kiểm tra của bạn</h2><p className="muted">Chọn số câu và cách trả lời trước khi bắt đầu.</p><div className="form-grid"><label className="field"><span>Số câu hỏi</span><input className="input" type="number" min="1" max={deck.length} value={testNumber} onChange={e => setTestNumber(Math.max(1,Math.min(deck.length,Number(e.target.value))))} /></label><label className="field"><span>Dạng câu hỏi</span><select className="select" value={testType} onChange={e => setTestType(e.target.value as typeof testType)}><option value="typing">Gõ nghĩa</option><option value="multiple">Chọn đáp án</option></select></label></div><button className="btn primary" onClick={startTest}><Play /> Bắt đầu kiểm tra</button></div> : testDone ? <div><Result correct={correct} total={deck.length} onAgain={() => beginMode('test')} onBack={() => setView('set')} /><div className="panel" style={{ marginTop: 20 }}><h3>Xem lại đáp án</h3>{deck.map((c,i) => <div key={c.id} style={{ borderTop: '1px solid var(--line)', padding: '12px 0' }}><strong>{i+1}. {c.term}</strong><p style={{ margin: '4px 0', color: normalizeAnswer(testAnswers[c.id] || '') === normalizeAnswer(c.definition) ? '#3da77c' : '#d65d6b' }}>Bạn trả lời: {testAnswers[c.id] || 'Bỏ trống'}</p><small className="muted">Đáp án: {c.definition}</small></div>)}</div></div> : <><div className="between" style={{ marginBottom: 15 }}><h2 style={{ margin: 0 }}>Bài kiểm tra</h2><span className="pill">{deck.length} câu hỏi</span></div>{deck.map((c,i) => <div className="panel" key={c.id} style={{ marginBottom: 14 }}><div className="eyebrow">CÂU {i+1}</div><h3 style={{ margin: '12px 0' }}>{c.term} có nghĩa là gì?</h3>{testType === 'typing' ? <input className="input" value={testAnswers[c.id] || ''} onChange={e => setTestAnswers(a => ({ ...a, [c.id]: e.target.value }))} placeholder="Nhập nghĩa..." /> : <div className="answer-grid">{testChoices[c.id]?.map(choice => <button key={choice} className={`answer-option ${testAnswers[c.id] === choice ? 'selected' : ''}`} onClick={() => setTestAnswers(a => ({ ...a, [c.id]: choice }))}>{choice}</button>)}</div>}</div>)}<button className="btn primary" onClick={finishTest}>Nộp bài kiểm tra <Check /></button></>}
+  const inStudy = studyViews.includes(view);
+  const goalPercent = Math.min(100, Math.round(todayReviewed / goal * 100));
+  const setBackView: View = activeSet && !ownsActiveSet ? sharedSets.some(s => s.id === activeSet.id) ? 'shared' : 'discover' : 'library';
+  /** Search lives on the Library/Discover pages; the header button jumps there and focuses it. */
+  function openSearch() { if (view !== 'library' && view !== 'discover' && !go('library')) return; setTimeout(() => document.getElementById('page-search')?.focus(), 250); }
+  const searchBox = <div className="search page-search"><Search size={17} /><input id="page-search" type="search" aria-label="Tìm kiếm bộ từ" value={search} onChange={e => setSearch(e.target.value)} placeholder="Tìm bộ từ, chủ đề…" />{search && <button className="icon-button plain" aria-label="Xoá tìm kiếm" onClick={() => setSearch('')}><X size={15} /></button>}</div>;
+  const exitDemo = () => { setDemo(false); setData({ sets: [], cards: [], sessions: [], profile: null }); };
+
+  if (!authReady) return <div className="splash"><div className="brand-mark"><Heart size={20} fill="currentColor" /></div><div className="skeleton" style={{ width: 180, height: 14 }} /></div>;
+
+  if ((!userId && !demo) || authMode === 'update') return <div className="auth-shell">
+    <div className="auth-visual">
+      <div className="brand"><div className="brand-mark"><Heart size={18} fill="currentColor" /></div>VanLet</div>
+      <div>
+        <span className="eyebrow">Học từ vựng nhẹ nhàng mỗi ngày</span>
+        <h1>Học ít mỗi ngày,<br />nhớ lâu cả đời.</h1>
+        <p>Tạo bộ từ trong vài giây, rồi học bằng thẻ lật, câu hỏi chọn đáp án, trò ghép cặp và ôn lại đúng lúc.</p>
+        <ul className="auth-points">
+          <li><Check size={16} /> Dán cả danh sách từ Excel hay Google Docs chỉ một lần</li>
+          <li><Check size={16} /> Tự nhắc bạn ôn lại đúng lúc sắp quên</li>
+          <li><Check size={16} /> Học trên điện thoại hay máy tính đều được, chia sẻ với bạn bè</li>
+        </ul>
+      </div>
+      <div className="auth-cards" aria-hidden="true"><div className="auth-card one"><small>Từ</small><strong>serendipity</strong></div><div className="auth-card two"><small>Nghĩa</small><strong>sự tình cờ may mắn</strong></div></div>
+    </div>
+    <div className="auth-form-wrap"><div className="auth-box">
+      <div className="brand mobile-only"><div className="brand-mark"><Heart size={18} fill="currentColor" /></div>VanLet</div>
+      <h1>{authMode === 'login' ? 'Chào mừng trở lại' : authMode === 'signup' ? 'Tạo tài khoản' : authMode === 'update' ? 'Tạo mật khẩu mới' : 'Đặt lại mật khẩu'}</h1>
+      <p className="muted">{configured ? 'Lưu bộ từ và tiến độ học để học tiếp trên mọi thiết bị.' : 'Hiện chưa đăng nhập được. Bạn vẫn có thể dùng thử ngay trên máy này.'}</p>
+      {configured && googleEnabled && authMode !== 'reset' && authMode !== 'update' && <button className="btn block" onClick={signInGoogle}><Globe2 /> Tiếp tục với Google</button>}
+      {configured && googleEnabled && authMode !== 'reset' && authMode !== 'update' && <div className="divider"><span>hoặc dùng email</span></div>}
+      {configured && <form onSubmit={doAuth}>
+        {authMode !== 'update' && <label className="field"><span>Email</span><input className="input" type="email" autoComplete="email" required value={authEmail} onChange={e => setAuthEmail(e.target.value)} placeholder="ban@email.com" /></label>}
+        {authMode !== 'reset' && <label className="field"><span>Mật khẩu</span><input className="input" type="password" autoComplete={authMode === 'login' ? 'current-password' : 'new-password'} minLength={6} required value={authPassword} onChange={e => setAuthPassword(e.target.value)} placeholder="Ít nhất 6 ký tự" /></label>}
+        {authMode === 'login' && <div className="auth-forgot"><button type="button" className="link" onClick={() => setAuthMode('reset')}>Quên mật khẩu?</button></div>}
+        <button className="btn primary block big" disabled={loading}>{loading ? 'Đang xử lý…' : authMode === 'login' ? 'Đăng nhập' : authMode === 'signup' ? 'Đăng ký' : authMode === 'update' ? 'Lưu mật khẩu mới' : 'Gửi email đặt lại'}</button>
+        <p className="auth-switch">{authMode === 'signup' ? 'Đã có tài khoản?' : authMode === 'login' ? 'Mới dùng VanLet?' : ''} <button type="button" className="link" onClick={() => setAuthMode(authMode === 'login' ? 'signup' : 'login')}>{authMode === 'login' ? 'Tạo tài khoản' : 'Đăng nhập'}</button></p>
+      </form>}
+      {authMode !== 'update' && <><div className="divider"><span>{configured ? 'hoặc' : 'bắt đầu'}</span></div>
+      <button className="btn soft block" onClick={() => setDemo(true)}>Dùng thử không cần tài khoản <ArrowRight size={15} /></button>
+      <p className="muted small-note">Khi dùng thử, dữ liệu chỉ lưu trên máy này. Đăng nhập để giữ lâu dài.</p></>}
+    </div></div>
+    {message && <div className="toast" role="status" aria-live="polite">{message}</div>}
+  </div>;
+
+  return <div className={`app ${inStudy ? 'focus-mode' : ''}`}>
+    <a className="skip-link" href="#main">Bỏ qua đến nội dung chính</a>
+    {!inStudy && <header className="topbar">
+      <div className="topbar-inner">
+        <button className="brand" onClick={() => go('dashboard')} aria-label="VanLet – về trang chủ"><span className="brand-mark"><Heart size={17} fill="currentColor" /></span>VanLet</button>
+        <nav className="top-nav" aria-label="Điều hướng chính">
+          {headerNav.map(item => <button key={item.id} title={item.name} className={`top-link ${view === item.id ? 'active' : ''}`} aria-current={view === item.id ? 'page' : undefined} onClick={() => navTo(item.id)}><item.icon /><span>{item.name}</span>{item.id === 'review' && dueCount > 0 && <span className="nav-badge">{dueCount}</span>}</button>)}
+        </nav>
+        <div className="top-actions">
+          {demo && <span className="badge-demo" title="Dữ liệu chỉ lưu trên máy này">Dùng thử</span>}
+          <button className="icon-button" aria-label="Tìm bộ từ" title="Tìm bộ từ" onClick={openSearch}><Search size={17} /></button>
+          <button className="icon-button" aria-label={dark ? 'Chuyển sang giao diện sáng' : 'Chuyển sang giao diện tối'} title={dark ? 'Giao diện sáng' : 'Giao diện tối'} onClick={() => setDark(v => !v)}>{dark ? <Sun size={17} /> : <Moon size={17} />}</button>
+          <button className="btn primary small top-create" onClick={() => openEditor()}><Plus /> Tạo bộ từ</button>
+          <button className="avatar" aria-label="Hồ sơ và cài đặt" title="Hồ sơ và cài đặt" onClick={() => go('settings')}>{(data.profile?.display_name || 'V').charAt(0).toUpperCase()}</button>
+        </div>
+      </div>
+    </header>}
+
+    <main className="main" id="main">
+
+      <div className={`content ${view === 'editor' ? 'narrow' : ''}`}><AnimatePresence mode="wait"><motion.div key={view + (selectedId || '')} initial={{ opacity: 0, y: 6 }} animate={{ opacity: 1, y: 0 }} exit={{ opacity: 0 }} transition={{ duration: .16 }}>
+
+        {view === 'dashboard' && <>
+          <div className="welcome"><h1>Chào {data.profile?.display_name || 'bạn'} 👋</h1><p>Mỗi từ mới là một bước gần hơn đến mục tiêu của bạn.</p></div>
+          <div className="hero">
+            <div className="hero-copy">
+              <span className="eyebrow">Tiếp tục hành trình</span>
+              <h2>{dueCount ? `${dueCount} từ đang chờ bạn ôn lại` : 'Hôm nay học gì nhỉ?'}</h2>
+              <p>{dueCount ? 'Ôn lại ngay bây giờ để nhớ lâu hơn. Chỉ mất vài phút thôi.' : 'Hôm nay chưa có từ nào cần ôn. Học một bộ từ hoặc tự tạo bộ từ mới nhé.'}</p>
+              <div className="row wrap">{dueCount ? <button className="btn primary" onClick={() => beginMode('review', true)}>Bắt đầu ôn tập <ArrowRight size={16} /></button> : <button className="btn primary" onClick={() => openEditor()}><Plus /> Tạo bộ từ</button>}<button className="btn" onClick={() => go('library')}>Mở thư viện</button></div>
+            </div>
+            <div className="hero-visual" aria-hidden="true"><div className="hero-card back" /><div className="hero-card"><small>Từ</small><strong>resilient</strong><span /></div></div>
+          </div>
+          <div className="stats-grid">
+            <Stat icon={LibraryBig} label="Bộ từ" value={data.sets.length} caption="Sẵn sàng để học" tone="violet" />
+            <Stat icon={BookOpen} label="Tổng số thẻ" value={totalCards} caption="Trong thư viện" tone="green" />
+            <Stat icon={Check} label="Đã thuộc" value={mastered} caption="Từ đã nhớ chắc" tone="blue" />
+            <Stat icon={Clock3} label="Cần ôn hôm nay" value={dueCount} caption="Ôn để không quên" tone="amber" />
+          </div>
+          <div className="section-heading between"><h2>Bộ từ gần đây</h2><button className="btn ghost small" onClick={() => go('library')}>Xem tất cả <ArrowRight /></button></div>
+          {data.sets.length ? <div className="set-grid">{data.sets.slice(0, 3).map(s => <SetCard key={s.id} set={s} onClick={() => openSet(s.id)} />)}</div> : <Empty title="Tạo bộ từ đầu tiên" text="Gõ hoặc dán danh sách từ của bạn – chỉ mất chưa đến một phút." action="Tạo bộ từ" onClick={() => openEditor()} />}
+          <div className="two-col" style={{ marginTop: 32 }}>
+            <section className="panel"><div className="between"><div><h2>Hoạt động học tập</h2><span className="muted small">7 ngày gần đây · {activityByDay.reduce((n, d) => n + d.value, 0)} lượt</span></div><button className="btn ghost small" onClick={() => go('stats')}>Thống kê <ArrowRight /></button></div><ActivityChart days={activityByDay} height={170} /></section>
+            <section className="panel goal-panel"><div className="between"><div className="tone-icon violet"><Target size={20} /></div><span className="pill">{goalPercent}%</span></div><h3>{todayReviewed} / {goal} lượt học</h3><p className="muted small">Mục tiêu hôm nay – một chút mỗi ngày, khác biệt lâu dài.</p><div className="progress-track" role="progressbar" aria-label="Mục tiêu hôm nay" aria-valuenow={goalPercent} aria-valuemin={0} aria-valuemax={100}><span style={{ width: `${goalPercent}%` }} /></div><div className="row muted small" style={{ marginTop: 16 }}><Clock3 size={15} /> {todayMinutes} phút học hôm nay</div></section>
+          </div>
         </>}
-      </>}</div>}
-      {view === 'stats' && <><div className="welcome"><div className="eyebrow">NHÌN LẠI HÀNH TRÌNH</div><h1>Thống kê học tập</h1><p>Tiến bộ được tạo nên từ từng buổi học.</p></div><div className="stats-grid"><Stat icon={BookOpen} label="Tổng số từ" value={totalCards} caption="Trong thư viện" tint="#eeeaff" color="#6958e8" /><Stat icon={Check} label="Đã thuộc" value={mastered} caption="Từ ghi nhớ vững" tint="#e3f5ed" color="#39a980" /><Stat icon={Flame} label="Lượt học" value={data.sessions.length} caption="Phiên đã hoàn thành" tint="#fff0e5" color="#e49554" /><Stat icon={Target} label="Độ chính xác" value={`${Math.round(data.sessions.reduce((n,s)=>n+s.correct,0)/Math.max(1,data.sessions.reduce((n,s)=>n+s.total,0))*100)}%`} caption="Qua các phiên học" tint="#e7efff" color="#5c8ee4" /></div><div className="two-col"><div className="panel"><h2>7 ngày gần đây</h2><p className="muted">Lượt từ đã luyện tập mỗi ngày</p><ActivityChart days={activityByDay} height={230} /></div><div className="panel"><h2>Lịch sử gần đây</h2>{data.sessions.length ? data.sessions.slice(0,7).map(s => <div className="between" key={s.id} style={{ padding: '12px 0', borderBottom: '1px solid var(--line)' }}><div><strong>{modes.find(m => m.id === s.mode)?.name || s.mode}</strong><div className="muted" style={{ fontSize: 12 }}>{formatDate(s.created_at)} · {Math.ceil(s.duration_seconds/60)} phút</div></div><span className="pill">{s.correct}/{s.total}</span></div>) : <p className="muted">Chưa có phiên học. Bắt đầu luyện tập để xem tiến độ.</p>}</div></div></>}
-      {view === 'settings' && <><div className="welcome"><div className="eyebrow">TÙY CHỈNH TRẢI NGHIỆM</div><h1>Cài đặt</h1><p>Điều chỉnh không gian học theo ý bạn.</p></div><div className="panel" style={{ maxWidth: 650 }}><h2>Hồ sơ & mục tiêu</h2><label className="field"><span>Tên hiển thị</span><input className="input" value={profileName} onChange={e => setProfileName(e.target.value)} placeholder="Tên của bạn" /></label><div className="form-grid"><label className="field"><span>Ngôn ngữ đang học</span><select className="select" value={learningLanguage} onChange={e => setLearningLanguage(e.target.value)}><option>English</option><option>日本語</option><option>中文</option><option>한국어</option><option>Français</option></select></label><label className="field"><span>Mục tiêu mỗi ngày (lượt học)</span><input className="input" type="number" min="1" max="1000" value={dailyGoal} onChange={e => setDailyGoal(Number(e.target.value))} /></label></div><button className="btn primary" onClick={saveProfile}><Save /> Lưu cài đặt</button><div style={{ borderTop: '1px solid var(--line)', margin: '25px 0' }} /><div className="between"><div><strong>Giao diện tối</strong><p className="muted" style={{ margin: 0, fontSize: 12 }}>Dễ chịu hơn khi học vào buổi tối</p></div><button className="btn" onClick={() => setDark(v => !v)}>{dark ? <Sun /> : <Moon />}{dark ? 'Đang bật' : 'Đang tắt'}</button></div>{demo && <p className="muted" style={{ fontSize: 12, marginTop: 24 }}>Dữ liệu demo chỉ lưu trên trình duyệt hiện tại. Đăng nhập bằng tài khoản Supabase để đồng bộ.</p>}</div></>}
-    </motion.div></AnimatePresence></div></main><nav className="mobile-nav">{[nav[0],nav[1],nav[2],nav[3],{ id:'discover' as View,name:'Khám phá',icon:Globe2 }].map(item => <button key={item.id} className={view === item.id ? 'active' : ''} onClick={() => navTo(item.id)}><item.icon />{item.name}</button>)}</nav>
-    {modal && <div className="modal-backdrop" onMouseDown={e => e.target === e.currentTarget && setModal(null)}><div className="modal"><div className="between modal-header"><h2>{modal === 'share' ? 'Chia sẻ bộ từ' : modal === 'folder' ? editingFolder ? 'Đổi tên thư mục' : 'Tạo thư mục' : modal === 'set' ? editingSet ? 'Chỉnh sửa bộ từ' : 'Tạo bộ từ mới' : editingCard ? 'Chỉnh sửa thẻ' : 'Thêm thẻ mới'}</h2><button className="icon-button" onClick={() => setModal(null)}><X size={18} /></button></div>{modal === 'share' ? <><p className="muted">Mời bằng email. Người nhận đăng nhập bằng đúng email rồi mở liên kết để nhận quyền.</p><label className="field"><span>Email người nhận</span><input className="input" type="email" value={shareEmail} onChange={e => setShareEmail(e.target.value)} placeholder="friend@example.com" /></label><label className="field"><span>Quyền truy cập</span><select className="select" value={shareRole} onChange={e => setShareRole(e.target.value as typeof shareRole)}><option value="viewer">Chỉ xem và học</option><option value="editor">Chỉnh sửa thẻ</option></select></label><button className="btn primary" onClick={createShareInvite}><Plus /> Tạo liên kết mời</button>{shareLink && <div className="row" style={{ marginTop: 15 }}><input className="input" readOnly value={shareLink} /><button className="btn" onClick={async () => { await navigator.clipboard.writeText(shareLink); toast('Đã sao chép liên kết.'); }}><Copy /></button></div>}<div style={{ borderTop: '1px solid var(--line)', margin: '22px 0' }} /><h3>Lời mời đã tạo</h3>{shareInvites.length ? shareInvites.map(invite => <div key={invite.token} className="between" style={{ padding: '9px 0', borderBottom: '1px solid var(--line)' }}><div><strong>{invite.email}</strong><div className="muted" style={{ fontSize: 12 }}>{invite.role === 'editor' ? 'Chỉnh sửa' : 'Chỉ xem'} · {invite.accepted_at ? 'Đã nhận' : 'Chờ nhận'}</div></div><button className="icon-button" title="Thu hồi" onClick={() => revokeShareInvite(invite)}><Trash2 size={15} /></button></div>) : <p className="muted">Chưa có lời mời nào.</p>}</> : modal === 'folder' ? <><label className="field"><span>Tên thư mục *</span><input className="input" autoFocus value={folderName} onChange={e => setFolderName(e.target.value)} placeholder="Ví dụ: Tiếng Nhật" /></label><button className="btn primary" style={{ width: '100%' }} onClick={saveFolder}><Save /> Lưu thư mục</button></> : modal === 'set' ? <><label className="field"><span>Tên bộ từ *</span><input className="input" autoFocus value={setDraft.title} onChange={e => setSetDraft(d => ({ ...d, title: e.target.value }))} placeholder="Ví dụ: Everyday English" /></label><label className="field"><span>Mô tả</span><textarea className="textarea" value={setDraft.description} onChange={e => setSetDraft(d => ({ ...d, description: e.target.value }))} placeholder="Bộ từ này giúp bạn học gì?" /></label><div className="form-grid"><label className="field"><span>Ngôn ngữ nguồn</span><input className="input" value={setDraft.source_language} onChange={e => setSetDraft(d => ({ ...d, source_language: e.target.value }))} /></label><label className="field"><span>Ngôn ngữ đích</span><input className="input" value={setDraft.target_language} onChange={e => setSetDraft(d => ({ ...d, target_language: e.target.value }))} /></label><label className="field"><span>Quyền xem</span><select className="select" value={setDraft.visibility} onChange={e => setSetDraft(d => ({ ...d, visibility: e.target.value as SetDraft['visibility'] }))}><option value="private">Riêng tư</option><option value="public">Công khai</option></select></label><label className="field"><span>Màu bìa</span><select className="select" value={setDraft.cover_color} onChange={e => setSetDraft(d => ({ ...d, cover_color: e.target.value }))}><option value="violet">Tím</option><option value="peach">Cam đào</option><option value="mint">Xanh bạc hà</option><option value="blue">Xanh dương</option></select></label></div><label className="field"><span>Thư mục</span><select className="select" value={setDraft.folder_id || ''} onChange={e => setSetDraft(d => ({ ...d, folder_id: e.target.value || null }))}><option value="">Không thuộc thư mục</option>{(data.folders || []).map(folder => <option key={folder.id} value={folder.id}>{folder.name}</option>)}</select></label><label className="field"><span>Tags (cách nhau bằng dấu phẩy)</span><input className="input" value={setDraft.tags.join(', ')} onChange={e => setSetDraft(d => ({ ...d, tags: e.target.value.split(',').map(t => t.trim()).filter(Boolean) }))} placeholder="Giao tiếp, B1" /></label><button className="btn primary" style={{ width: '100%' }} onClick={saveSet}><Save /> Lưu bộ từ</button></> : <><div className="form-grid"><label className="field"><span>Từ / cụm từ *</span><input className="input" autoFocus value={cardDraft.term} onChange={e => setCardDraft(d => ({ ...d, term: e.target.value }))} /></label><label className="field"><span>Nghĩa *</span><input className="input" value={cardDraft.definition} onChange={e => setCardDraft(d => ({ ...d, definition: e.target.value }))} /></label></div><label className="field"><span>Phiên âm</span><input className="input" value={cardDraft.phonetic} onChange={e => setCardDraft(d => ({ ...d, phonetic: e.target.value }))} placeholder="/fəˈnet.ɪk/" /></label><label className="field"><span>Ví dụ</span><textarea className="textarea" value={cardDraft.example} onChange={e => setCardDraft(d => ({ ...d, example: e.target.value }))} /></label><label className="field"><span>Dịch ví dụ</span><input className="input" value={cardDraft.example_translation} onChange={e => setCardDraft(d => ({ ...d, example_translation: e.target.value }))} /></label><label className="field"><span>Ghi chú</span><textarea className="textarea" value={cardDraft.notes} onChange={e => setCardDraft(d => ({ ...d, notes: e.target.value }))} /></label><div className="form-grid"><label className="field"><span>Đồng nghĩa</span><input className="input" value={cardDraft.synonyms} onChange={e => setCardDraft(d => ({ ...d, synonyms: e.target.value }))} /></label><label className="field"><span>Trái nghĩa</span><input className="input" value={cardDraft.antonyms} onChange={e => setCardDraft(d => ({ ...d, antonyms: e.target.value }))} /></label></div><button className="btn primary" style={{ width: '100%' }} onClick={saveCard}><Save /> Lưu thẻ</button></>}</div></div>}{message && <div className="toast" role="status">{message}</div>}
+
+        {view === 'library' && <>
+          <div className="between mobile-stack welcome"><div><h1>Thư viện của bạn</h1><p>{filteredSets.length} bộ từ · {data.sets.reduce((n, s) => n + (s.card_count || data.cards.filter(c => c.set_id === s.id).length), 0)} thẻ</p></div><button className="btn primary" onClick={() => openEditor()}><Plus /> Tạo bộ từ</button></div>
+          {searchBox}
+          <FolderBar folders={data.folders || []} selected={folderFilter} onSelect={setFolderFilter} onAdd={() => openFolderForm()} onEdit={openFolderForm} onDelete={deleteFolder} />
+          {loading ? <div className="set-grid">{[1, 2, 3].map(n => <div className="skeleton" key={n} style={{ height: 196 }} />)}</div>
+            : filteredSets.length ? <div className="set-grid">{filteredSets.map(s => <SetCard key={s.id} set={s} onClick={() => openSet(s.id)} />)}</div>
+            : <Empty title={search ? 'Không tìm thấy bộ từ' : 'Thư viện đang trống'} text={search ? 'Thử một từ khóa khác.' : 'Tạo bộ từ đầu tiên và bắt đầu hành trình.'} action={search ? 'Xóa tìm kiếm' : 'Tạo bộ từ'} onClick={() => search ? setSearch('') : openEditor()} />}
+          {!demo && !search && data.sets.length < setsTotal && <div className="center-row"><button className="btn" onClick={loadMoreSets}>Tải thêm bộ từ <ChevronRight /></button></div>}
+        </>}
+
+        {view === 'shared' && <SharedPanel sets={sharedSets} total={sharedTotal} onOpen={openSet} onMore={() => loadShared(sharedPage + 1)} />}
+        {view === 'discover' && <DiscoverPanel searchBox={searchBox} sets={discoveredSets} total={discoveredTotal} onOpen={openSet} onMore={() => loadDiscover(discoveredPage + 1, search)} onCreate={() => openEditor()} />}
+
+        {view === 'editor' && editor && <SetEditor key={editor.setId || 'new'} mode={editor.mode} initialSet={editor.set} initialCards={editor.cards} canEditMeta={editor.mode === 'create' || demo || (data.sets.find(s => s.id === editor.setId) || sharedSets.find(s => s.id === editor.setId) || discoveredSets.find(s => s.id === editor.setId))?.owner_id === userId} folders={data.folders || []} focusKey={editor.focusKey} openImport={editor.openImport} saving={editorSaving} onCancel={closeEditor} onSave={saveEditor} onDirtyChange={dirty => { editorDirty.current = dirty; }} notify={toast} />}
+
+        {view === 'set' && activeSet && <>
+          <button className="btn ghost small back-link" onClick={() => go(setBackView)}><ChevronLeft /> {setBackView === 'library' ? 'Thư viện' : setBackView === 'shared' ? 'Được chia sẻ' : 'Khám phá'}</button>
+          <div className="set-header">
+            <div>
+              <h1>{activeSet.title}</h1>
+              <div className="set-header-meta"><span className="pill">{activeSet.source_language} → {activeSet.target_language}</span><span>{demo ? activeCards.length : cardTotal} thẻ</span><span>{activeSet.visibility === 'public' ? <><Globe2 size={13} /> Công khai</> : 'Riêng tư'}</span>{(activeSet.tags || []).map(t => <span key={t} className="tag">#{t}</span>)}</div>
+              {activeSet.description && <p className="muted">{activeSet.description}</p>}
+            </div>
+            <div className="row wrap">
+              {canEditActiveCards && <button className="btn" onClick={() => openEditor(activeSet)}><Pencil /> Chỉnh sửa</button>}
+              {ownsActiveSet && !demo && <button className="btn" onClick={openShareForm}><Users /> Mời học cùng</button>}
+              {ownsActiveSet && <button className="icon-button danger" onClick={() => deleteSet(activeSet)} aria-label="Xóa bộ từ" title="Xóa bộ từ"><Trash2 size={17} /></button>}
+            </div>
+          </div>
+          <div className="mode-grid">{modes.map(m => <button key={m.id} className={`mode-card ${m.tone}`} onClick={() => beginMode(m.id)}><span className={`tone-icon ${m.tone}`}><m.icon size={20} /></span><span><strong>{m.name}</strong><small>{m.desc}</small></span></button>)}</div>
+          {activeCards.length > 0 && <SetPreview key={activeSet.id} cards={activeCards} onExpand={() => beginMode('flashcards')} onSpeak={text => { if (!pronounce(text, activeSet.source_language)) toast('Trình duyệt này không hỗ trợ phát âm.'); }} />}
+          <div className="between mobile-stack section-heading terms-heading"><h2>Các từ trong bộ này <span className="muted">({demo ? activeCards.length : cardTotal})</span></h2>{canEditActiveCards && <div className="row wrap"><button className="btn" onClick={() => openEditor(activeSet, { importing: true })}><FileUp /> Nhập</button><button className="btn primary" onClick={() => openEditor(activeSet, { focus: 'new' })}><Plus /> Thêm thẻ</button></div>}</div>
+          {activeCards.length ? <ul className="term-list">{activeCards.map(c => <li className="term-row" key={c.id}>
+            <div className="term-cell"><strong>{c.term}</strong>{c.phonetic && <small>{c.phonetic}</small>}</div>
+            <div className="def-cell">{c.definition}{c.example && <small>{c.example}</small>}</div>
+            <div className="term-actions">
+              <button className={`icon-button plain ${c.favorite ? 'starred' : ''}`} aria-label={c.favorite ? `Bỏ đánh dấu sao “${c.term}”` : `Đánh dấu sao “${c.term}”`} aria-pressed={c.favorite} disabled={!canEditActiveCards} onClick={() => toggleCard(c, 'favorite')}><Star size={17} fill={c.favorite ? 'currentColor' : 'none'} /></button>
+              <button className="icon-button plain" aria-label={`Nghe “${c.term}”`} onClick={() => { if (!pronounce(c.term, activeSet.source_language)) toast('Trình duyệt này không hỗ trợ phát âm.'); }}><Volume2 size={17} /></button>
+              {canEditActiveCards && <button className="icon-button plain" aria-label={`Sửa “${c.term}”`} onClick={() => openEditor(activeSet, { focus: c.id })}><Pencil size={16} /></button>}
+              {canEditActiveCards && <button className="icon-button plain" aria-label={`Xóa “${c.term}”`} onClick={() => deleteCard(c)}><Trash2 size={16} /></button>}
+            </div>
+          </li>)}</ul> : <Empty title="Chưa có thẻ nào" text={canEditActiveCards ? 'Gõ từng thẻ hoặc dán cả danh sách từ Excel, Google Docs.' : 'Chủ sở hữu chưa thêm thẻ nào.'} action={canEditActiveCards ? 'Thêm thẻ' : 'Quay lại'} onClick={() => canEditActiveCards ? openEditor(activeSet, { focus: 'new' }) : go(setBackView)} />}
+          {!demo && cardTotal > 100 && <div className="center-row"><button className="btn" disabled={cardPage === 0} onClick={() => loadCards(activeSet.id, cardPage - 1)}><ChevronLeft /> Trang trước</button><span className="muted">Trang {cardPage + 1}/{Math.ceil(cardTotal / 100)}</span><button className="btn" disabled={(cardPage + 1) * 100 >= cardTotal} onClick={() => loadCards(activeSet.id, cardPage + 1)}>Trang sau <ChevronRight /></button></div>}
+          {canEditActiveCards && activeCards.length > 0 && <div className="center-row"><button className="btn soft big" onClick={() => openEditor(activeSet)}><Pencil /> Thêm hoặc xóa từ</button></div>}
+          <div className="set-secondary"><span className="muted small">Thêm</span><button className="btn ghost small" onClick={() => duplicateSet(activeSet)}><Copy /> Nhân bản</button><button className="btn ghost small" onClick={() => exportSet(activeSet, 'csv')}><Download /> Tải về (mở bằng Excel)</button>{activeSet.visibility === 'public' && <button className="btn ghost small" onClick={async () => { try { await navigator.clipboard.writeText(`${location.origin}/?set=${activeSet.id}`); toast('Đã sao chép liên kết. Người xem cần đăng nhập.'); } catch { toast('Không thể sao chép liên kết.'); } }}><Globe2 /> Sao chép liên kết</button>}</div>
+        </>}
+
+        {inStudy && <div className="study-wrap">
+          <div className="study-top">
+            <button className="btn ghost small" onClick={() => setView(selectedId ? 'set' : 'dashboard')}><X /> Thoát</button>
+            <div className="study-title"><span className={`tone-icon sm ${modes.find(m => m.id === view)?.tone}`}>{(() => { const M = modes.find(m => m.id === view)?.icon || Layers3; return <M size={15} />; })()}</span><strong>{modes.find(m => m.id === view)?.name}</strong>{activeSet && <span className="muted hide-sm">· {activeSet.title}</span>}</div>
+            <span className="study-count">{view === 'learn' ? `${learnMastered.length}/${learnTotal}` : view === 'match' ? `${matched.length}/${matchTerms.length}` : `${Math.min(index + 1, deck.length)}/${deck.length}`}</span>
+          </div>
+          {view !== 'test' && <div className="study-progress" role="progressbar" aria-label="Tiến độ" aria-valuemin={0} aria-valuemax={100} aria-valuenow={Math.round(view === 'learn' ? learnMastered.length / Math.max(1, learnTotal) * 100 : view === 'match' ? matched.length / Math.max(1, matchTerms.length) * 100 : Math.min(index + 1, deck.length) / Math.max(1, deck.length) * 100)}><span style={{ width: `${view === 'learn' ? learnMastered.length / Math.max(1, learnTotal) * 100 : view === 'match' ? matched.length / Math.max(1, matchTerms.length) * 100 : Math.min(index + 1, deck.length) / Math.max(1, deck.length) * 100}%` }} /></div>}
+          {deck.length === 0 ? <Empty title="Chưa có thẻ để học" text="Thêm thẻ vào bộ từ, hoặc quay lại sau khi có từ cần ôn." action="Về thư viện" onClick={() => setView('library')} /> : <>
+
+            {view === 'flashcards' && <>
+              {index >= deck.length ? <Result correct={correct} total={deck.length} onAgain={() => beginMode('flashcards')} onBack={() => setView('set')} /> : <>
+                <FlipCard flipped={flipped} onFlip={() => setFlipped(v => !v)}
+                  frontLabel={reverse ? 'Nghĩa' : 'Từ'} backLabel={reverse ? 'Từ' : 'Nghĩa'}
+                  front={reverse ? deck[index]?.definition : deck[index]?.term} back={reverse ? deck[index]?.term : deck[index]?.definition}
+                  frontHint={showHints && !reverse ? deck[index]?.phonetic : ''} backHint={showHints ? deck[index]?.example : ''} />
+                <div className="fc-nav">
+                  <button className="icon-button round big" aria-label="Thẻ trước (←)" disabled={index === 0} onClick={previousCard}><ChevronLeft /></button>
+                  <span className="fc-count">{index + 1} / {deck.length}</span>
+                  <button className="icon-button round big" aria-label="Thẻ tiếp (→)" onClick={async () => { if (index + 1 >= deck.length) { await saveSession('flashcards', correct, deck.length); setIndex(deck.length); } else nextCard(); }}><ChevronRight /></button>
+                </div>
+                <div className="fc-toolbar">
+                  <select className="select compact" aria-label="Lọc thẻ" value={filter} onChange={e => changeFilter(e.target.value as typeof filter)}><option value="all">Tất cả thẻ</option><option value="unmastered">Chưa thuộc</option><option value="difficult">Từ khó</option><option value="favorite">Đã gắn sao</option></select>
+                  <button className="btn ghost small" onClick={() => { setDeck(shuffle(deck)); setIndex(0); setFlipped(false); }}><Shuffle /> Trộn</button>
+                  <button className="btn ghost small" onClick={() => { setReverse(v => !v); setFlipped(false); }}><ArrowLeftRight /> Đổi mặt</button>
+                  <button className="btn ghost small" aria-pressed={showHints} onClick={() => setShowHints(v => !v)}>{showHints ? <EyeOff /> : <Eye />} {showHints ? 'Ẩn gợi ý' : 'Hiện gợi ý'}</button>
+                  <button className="btn ghost small" onClick={() => { if (!pronounce(deck[index]?.term || '', activeSet?.source_language)) toast('Trình duyệt này không hỗ trợ phát âm.'); }}><Volume2 /> Nghe</button>
+                </div>
+                <div className="fc-mark">
+                  <button className={`btn small ${deck[index]?.difficult ? 'warn' : ''}`} aria-pressed={deck[index]?.difficult} onClick={() => { toggleCard(deck[index], 'difficult'); toast(deck[index].difficult ? 'Đã bỏ đánh dấu từ khó.' : 'Đã đánh dấu từ khó.'); }}><Flame /> Từ khó</button>
+                  <button className={`btn small ${deck[index]?.mastered ? 'success' : ''}`} aria-pressed={deck[index]?.mastered} onClick={() => { if (!deck[index].mastered) { toggleCard(deck[index], 'mastered'); setCorrect(n => n + 1); } }}><Check /> Đã thuộc</button>
+                </div>
+                <p className="kbd-hint"><kbd>Space</kbd> lật thẻ · <kbd>←</kbd> <kbd>→</kbd> chuyển thẻ</p>
+              </>}
+            </>}
+
+            {view === 'learn' && <LearnPanel card={deck[index]} stage={learnStages[deck[index]?.id] || (learnTotal < 2 ? 'typing' : 'choice')} options={learnOptions} choice={learnChoice} answer={answer} feedback={feedback} mastered={learnMastered.length} total={learnTotal} attempts={learnAttempts} onChoice={value => { void submitLearn(value); }} onAnswer={setAnswer} onSubmit={() => { void submitLearn(); }} onSkip={() => { void submitLearn('', true); }} onNext={advanceLearn} onRestart={() => beginMode('learn')} onBack={() => setView('set')} />}
+
+            {view === 'review' && <>{index >= deck.length ? <Result correct={correct} total={deck.length} onAgain={() => beginMode('review')} onBack={() => setView(selectedId ? 'set' : 'dashboard')} /> : <>
+              <FlipCard flipped={flipped} onFlip={() => setFlipped(v => !v)} frontLabel="Bạn còn nhớ từ này?" backLabel="Nghĩa" front={deck[index].term} back={deck[index].definition} frontHint={deck[index].phonetic} backHint={deck[index].example} />
+              {flipped ? <div className="rating-row">{(['again', 'hard', 'good', 'easy'] as Rating[]).map((rating, i) => <button className={`rating ${rating}`} key={rating} onClick={async () => { await rateCard(deck[index], rating); if (rating !== 'again') setCorrect(n => n + 1); if (index + 1 >= deck.length) { await saveSession('review', correct + Number(rating !== 'again'), deck.length); setIndex(deck.length); } else nextCard(); }}><strong>{['Quên rồi', 'Khó', 'Nhớ', 'Dễ'][i]}</strong><small>{['Gặp lại ngay', 'Gặp lại sớm', 'Gặp lại sau vài ngày', 'Lâu nữa mới gặp lại'][i]}</small></button>)}</div>
+                : <p className="kbd-hint">Nghĩ xem từ này nghĩa là gì, rồi lật thẻ để xem mình nhớ đúng không.</p>}
+            </>}</>}
+
+            {view === 'match' && <>{matched.length === matchTerms.length ? <Result correct={matched.length} total={matched.length} onAgain={() => beginMode('match')} onBack={() => setView('set')} extra={`Thời gian: ${Math.floor(elapsed / 60)}:${String(elapsed % 60).padStart(2, '0')}`} /> : <>
+              <div className="between match-head"><p className="muted">Chọn một từ rồi chọn nghĩa tương ứng.</p><span className="timer"><Clock3 size={15} /> {Math.floor(elapsed / 60)}:{String(elapsed % 60).padStart(2, '0')}</span></div>
+              <div className="match-grid">
+                <div>{matchTerms.map(c => <button key={c.id} className={`match-tile ${matched.includes(c.id) ? 'matched' : ''} ${matchSelection?.id === c.id && matchSelection.type === 'term' ? 'selected' : ''} ${wrongMatch && matchSelection?.id === c.id ? 'wrong' : ''}`} aria-pressed={matchSelection?.id === c.id && matchSelection.type === 'term'} disabled={matched.includes(c.id)} onClick={() => chooseMatch('term', c.id)}>{c.term}</button>)}</div>
+                <div>{matchDefinitions.map(c => <button key={c.id} className={`match-tile def ${matched.includes(c.id) ? 'matched' : ''} ${matchSelection?.id === c.id && matchSelection.type === 'definition' ? 'selected' : ''} ${wrongMatch && matchSelection?.id === c.id ? 'wrong' : ''}`} aria-pressed={matchSelection?.id === c.id && matchSelection.type === 'definition'} disabled={matched.includes(c.id)} onClick={() => chooseMatch('definition', c.id)}>{c.definition}</button>)}</div>
+              </div>
+            </>}</>}
+
+            {view === 'test' && <>
+              {!testStarted ? <div className="panel test-setup">
+                <span className="tone-icon blue"><GraduationCap size={20} /></span>
+                <h2>Chuẩn bị bài kiểm tra</h2>
+                <p className="muted">Chọn số câu và cách trả lời trước khi bắt đầu.</p>
+                <div className="form-grid">
+                  <label className="field"><span>Số câu hỏi (tối đa {deck.length})</span><input className="input" type="number" min="1" max={deck.length} value={testNumber} onChange={e => setTestNumber(Math.max(1, Math.min(deck.length, Number(e.target.value))))} /></label>
+                  <div className="field"><span>Dạng câu hỏi</span><div className="segmented" role="radiogroup" aria-label="Dạng câu hỏi"><button role="radio" aria-checked={testType === 'typing'} className={testType === 'typing' ? 'on' : ''} onClick={() => setTestType('typing')}>Tự gõ đáp án</button><button role="radio" aria-checked={testType === 'multiple'} className={testType === 'multiple' ? 'on' : ''} onClick={() => setTestType('multiple')}>Chọn đáp án</button></div></div>
+                </div>
+                <button className="btn primary big" onClick={startTest}><Play /> Bắt đầu kiểm tra</button>
+              </div> : testDone ? <div>
+                <Result correct={correct} total={deck.length} onAgain={() => beginMode('test')} onBack={() => setView('set')} />
+                <div className="panel review-answers"><h3>Xem lại đáp án</h3>{deck.map((c, i) => { const ok = normalizeAnswer(testAnswers[c.id] || '') === normalizeAnswer(c.definition); return <div key={c.id} className={`answer-review ${ok ? 'ok' : 'bad'}`}><span className="answer-mark" aria-label={ok ? 'Đúng' : 'Sai'}>{ok ? <Check size={14} /> : <X size={14} />}</span><div><strong>{i + 1}. {c.term}</strong><p>Bạn trả lời: {testAnswers[c.id] || <em>Bỏ trống</em>}</p>{!ok && <small>Đáp án: {c.definition}</small>}</div></div>; })}</div>
+              </div> : <>
+                <div className="between test-head"><h2>Bài kiểm tra</h2><span className="pill">{Object.values(testAnswers).filter(Boolean).length}/{deck.length} đã trả lời</span></div>
+                {deck.map((c, i) => <div className="panel test-q" key={c.id}>
+                  <div className="between"><span className="eyebrow">Từ</span><span className="muted small">{i + 1} / {deck.length}</span></div>
+                  <h3>{c.term}</h3>
+                  {testType === 'typing' ? <label className="field"><span>Nghĩa</span><input className="input" value={testAnswers[c.id] || ''} onChange={e => setTestAnswers(a => ({ ...a, [c.id]: e.target.value }))} placeholder="Nhập câu trả lời" /></label>
+                    : <div className="answer-grid" role="radiogroup" aria-label={`Chọn nghĩa cho ${c.term}`}>{testChoices[c.id]?.map((choice, k) => <button key={choice} role="radio" aria-checked={testAnswers[c.id] === choice} className={`answer-option ${testAnswers[c.id] === choice ? 'selected' : ''}`} onClick={() => setTestAnswers(a => ({ ...a, [c.id]: choice }))}><span className="option-key">{k + 1}</span><span>{choice}</span></button>)}</div>}
+                </div>)}
+                <div className="center-row"><button className="btn primary big" onClick={finishTest}>Nộp bài <Check /></button></div>
+              </>}
+            </>}
+          </>}
+        </div>}
+
+        {view === 'stats' && <>
+          <div className="welcome"><h1>Thống kê học tập</h1><p>Tiến bộ được tạo nên từ từng buổi học.</p></div>
+          <div className="stats-grid">
+            <Stat icon={BookOpen} label="Tổng số thẻ" value={totalCards} caption="Trong thư viện" tone="violet" />
+            <Stat icon={Check} label="Đã thuộc" value={mastered} caption="Từ đã nhớ chắc" tone="green" />
+            <Stat icon={Flame} label="Buổi học" value={data.sessions.length} caption="Đã hoàn thành" tone="amber" />
+            <Stat icon={Target} label="Tỉ lệ đúng" value={`${Math.round(data.sessions.reduce((n, s) => n + s.correct, 0) / Math.max(1, data.sessions.reduce((n, s) => n + s.total, 0)) * 100)}%`} caption="Qua các buổi học" tone="blue" />
+          </div>
+          <div className="two-col">
+            <div className="panel"><h2>7 ngày gần đây</h2><p className="muted small">Lượt thẻ đã luyện tập mỗi ngày</p><ActivityChart days={activityByDay} height={230} /></div>
+            <div className="panel"><h2>Lịch sử gần đây</h2>{data.sessions.length ? <ul className="history">{data.sessions.slice(0, 7).map(s => <li className="between" key={s.id}><div><strong>{modes.find(m => m.id === s.mode)?.name || s.mode}</strong><div className="muted small">{formatDate(s.created_at)} · {Math.ceil(s.duration_seconds / 60)} phút</div></div><span className="pill">{s.correct}/{s.total}</span></li>)}</ul> : <p className="muted">Chưa có buổi học nào. Học thử một bộ từ để xem tiến độ nhé.</p>}</div>
+          </div>
+        </>}
+
+        {view === 'settings' && <>
+          <div className="welcome"><h1>Cài đặt</h1><p>Điều chỉnh không gian học theo ý bạn.</p></div>
+          <div className="panel settings-panel">
+            <h2>Hồ sơ & mục tiêu</h2>
+            <label className="field"><span>Tên hiển thị</span><input className="input" value={profileName} onChange={e => setProfileName(e.target.value)} placeholder="Tên của bạn" /></label>
+            <div className="form-grid">
+              <label className="field"><span>Ngôn ngữ đang học</span><select className="select" value={learningLanguage} onChange={e => setLearningLanguage(e.target.value)}><option>English</option><option>日本語</option><option>中文</option><option>한국어</option><option>Français</option></select></label>
+              <label className="field"><span>Mục tiêu mỗi ngày (lượt học)</span><input className="input" type="number" min="1" max="1000" value={dailyGoal} onChange={e => setDailyGoal(Number(e.target.value))} /></label>
+            </div>
+            <button className="btn primary" onClick={saveProfile}><Save /> Lưu cài đặt</button>
+            <hr />
+            <div className="between"><div><strong>Giao diện tối</strong><p className="muted small" style={{ margin: 0 }}>Dễ chịu hơn khi học vào buổi tối</p></div><button className={`switch ${dark ? 'on' : ''}`} role="switch" aria-checked={dark} aria-label="Giao diện tối" onClick={() => setDark(v => !v)}><span /></button></div>
+            {demo && <p className="muted small" style={{ marginTop: 24 }}>Dữ liệu demo chỉ lưu trên trình duyệt hiện tại. Đăng nhập để đồng bộ.</p>}
+          </div>
+        </>}
+      </motion.div></AnimatePresence></div>
+    </main>
+
+    {!inStudy && <footer className="site-footer">
+      <div className="footer-inner">
+        <div className="footer-brand">
+          <button className="brand" onClick={() => go('dashboard')}><span className="brand-mark"><Heart size={17} fill="currentColor" /></span>VanLet</button>
+          <p className="muted small">Học từ vựng nhẹ nhàng mỗi ngày. Học ít, nhớ lâu.</p>
+        </div>
+        <div className="footer-goal">
+          <div className="between"><strong><Target size={15} /> Mục tiêu hôm nay</strong><span>{goalPercent}%</span></div>
+          <div className="tiny-progress" role="progressbar" aria-label="Tiến độ mục tiêu hôm nay" aria-valuenow={goalPercent} aria-valuemin={0} aria-valuemax={100}><span style={{ width: `${goalPercent}%` }} /></div>
+          <small className="muted">{todayReviewed}/{goal} từ · {todayMinutes} phút hôm nay</small>
+        </div>
+        <nav className="footer-links" aria-label="Liên kết phụ">
+          <button onClick={() => go('discover')}><Globe2 size={15} /> Bộ từ công khai</button>
+          <button onClick={() => go('stats')}><ChartNoAxesColumn size={15} /> Thống kê</button>
+          <button onClick={() => go('settings')}><Settings2 size={15} /> Cài đặt</button>
+          <button onClick={demo ? exitDemo : signOut}><LogOut size={15} /> {demo ? 'Thoát dùng thử' : 'Đăng xuất'}</button>
+        </nav>
+      </div>
+      <div className="footer-bottom">© {new Date().getFullYear()} VanLet · Làm bằng <Heart size={12} fill="currentColor" /> cho người học</div>
+    </footer>}
+
+    {!inStudy && <nav className="mobile-nav" aria-label="Điều hướng">{[nav[0], nav[1], { id: 'editor' as View, name: 'Tạo', icon: Plus }, { ...nav[3], name: 'Ôn tập' }, nav[4]].map(item => <button key={item.id} className={`${view === item.id ? 'active' : ''} ${item.id === 'editor' ? 'create' : ''}`} aria-current={view === item.id ? 'page' : undefined} onClick={() => item.id === 'editor' ? openEditor() : navTo(item.id)}><item.icon />{item.name}</button>)}</nav>}
+
+    {modal && <div className="modal-backdrop" onMouseDown={e => e.target === e.currentTarget && setModal(null)}><div className="modal" role="dialog" aria-modal="true" aria-labelledby="modal-title">
+      <div className="between modal-header"><h2 id="modal-title">{modal === 'share' ? 'Mời học cùng' : editingFolder ? 'Đổi tên thư mục' : 'Tạo thư mục'}</h2><button className="icon-button" aria-label="Đóng" onClick={() => setModal(null)}><X size={18} /></button></div>
+      {modal === 'share' ? <>
+        <p className="muted">Mời bằng email. Người nhận đăng nhập bằng đúng email rồi mở liên kết để nhận quyền.</p>
+        <label className="field"><span>Email người nhận</span><input className="input" type="email" autoComplete="off" value={shareEmail} onChange={e => setShareEmail(e.target.value)} placeholder="ban.be@email.com" /></label>
+        <label className="field"><span>Quyền truy cập</span><select className="select" value={shareRole} onChange={e => setShareRole(e.target.value as typeof shareRole)}><option value="viewer">Chỉ xem và học</option><option value="editor">Chỉnh sửa thẻ</option></select></label>
+        <button className="btn primary block" onClick={createShareInvite}><Plus /> Tạo liên kết mời</button>
+        {shareLink && <div className="row" style={{ marginTop: 15 }}><input className="input" readOnly aria-label="Liên kết mời" value={shareLink} onFocus={e => e.target.select()} /><button className="btn" aria-label="Sao chép liên kết" onClick={async () => { try { await navigator.clipboard.writeText(shareLink); toast('Đã sao chép liên kết.'); } catch { toast('Không thể sao chép liên kết.'); } }}><Copy /></button></div>}
+        <hr />
+        <h3>Lời mời đã tạo</h3>
+        {shareInvites.length ? <ul className="invite-list">{shareInvites.map(invite => <li key={invite.token} className="between"><div><strong>{invite.email}</strong><div className="muted small">{invite.role === 'editor' ? 'Chỉnh sửa' : 'Chỉ xem'} · {invite.accepted_at ? 'Đã nhận' : 'Chờ nhận'}</div></div><button className="icon-button" aria-label={`Thu hồi quyền của ${invite.email}`} title="Thu hồi" onClick={() => revokeShareInvite(invite)}><Trash2 size={15} /></button></li>)}</ul> : <p className="muted">Chưa có lời mời nào.</p>}
+      </> : <form onSubmit={e => { e.preventDefault(); void saveFolder(); }}>
+        <label className="field"><span>Tên thư mục</span><input className="input" autoFocus value={folderName} onChange={e => setFolderName(e.target.value)} placeholder="Ví dụ: Tiếng Nhật N3" /></label>
+        <button className="btn primary block"><Save /> Lưu thư mục</button>
+      </form>}
+    </div></div>}
+    {message && <div className="toast" role="status" aria-live="polite">{message}</div>}
   </div>;
 }
 
 function LearnPanel({ card, stage, options, choice, answer, feedback, mastered, total, attempts, onChoice, onAnswer, onSubmit, onSkip, onNext, onRestart, onBack }: { card: Card | undefined; stage: 'choice' | 'typing'; options: string[]; choice: string; answer: string; feedback: 'correct' | 'wrong' | null; mastered: number; total: number; attempts: number; onChoice: (value: string) => void; onAnswer: (value: string) => void; onSubmit: () => void; onSkip: () => void; onNext: () => void; onRestart: () => void; onBack: () => void }) {
+  // Number keys pick an option and Enter continues, as in Quizlet Learn.
+  useEffect(() => {
+    if (!card) return;
+    const onKey = (e: KeyboardEvent) => {
+      if (e.target instanceof HTMLInputElement || e.target instanceof HTMLTextAreaElement || e.target instanceof HTMLButtonElement) return;
+      if (feedback && e.key === 'Enter') { e.preventDefault(); onNext(); return; }
+      const n = Number(e.key); if (!feedback && stage === 'choice' && n >= 1 && n <= options.length) onChoice(options[n - 1]);
+    };
+    window.addEventListener('keydown', onKey); return () => window.removeEventListener('keydown', onKey);
+  }, [card, feedback, stage, options, onChoice, onNext]);
   if (!card) return <Result correct={mastered} total={total} onAgain={onRestart} onBack={onBack} />;
   const expected = card.definition;
   return <div className="learn-screen">
-    <div className="between learn-summary"><div><span className="eyebrow">CHẾ ĐỘ HỌC</span><h1>Học đến khi thuộc</h1></div><span className="pill">{mastered}/{total} từ đã thuộc</span></div>
-    <div className="progress-track learn-progress" role="progressbar" aria-valuenow={mastered} aria-valuemin={0} aria-valuemax={total}><span style={{ width: `${total ? mastered / total * 100 : 0}%` }} /></div>
-    <p className="muted learn-caption">{stage === 'choice' ? 'Bước 1 · Nhận diện nghĩa' : 'Bước 2 · Tự nhớ và gõ nghĩa'} · {attempts} lượt trả lời</p>
-    <div className="panel learn-panel"><div className="learn-question"><span className="eyebrow">{stage === 'choice' ? 'CHỌN ĐÁP ÁN ĐÚNG' : 'NHẬP ĐÁP ÁN'}</span><div className="learn-word">{card.term}</div><p className="muted">Từ này có nghĩa là gì?</p></div>
-      {stage === 'choice' ? <div className="learn-options">{options.map((option, i) => <button key={`${option}-${i}`} className={`answer-option ${feedback && normalizeAnswer(option) === normalizeAnswer(expected) ? 'correct' : feedback && option === choice ? 'wrong' : ''}`} disabled={!!feedback} onClick={() => onChoice(option)}><span className="option-key">{String.fromCharCode(65 + i)}</span><span>{option}</span></button>)}</div> : <label className="field learn-input"><span>Câu trả lời của bạn</span><input className="input" autoFocus value={answer} disabled={!!feedback} onChange={e => onAnswer(e.target.value)} onKeyDown={e => e.key === 'Enter' && (feedback ? onNext() : onSubmit())} placeholder="Gõ nghĩa của từ..." /></label>}
-      {feedback && <div className={`learn-feedback ${feedback}`} role="status"><strong>{feedback === 'correct' ? 'Chính xác!' : 'Chưa đúng, bạn sẽ gặp lại từ này.'}</strong><span>Đáp án: {expected}</span></div>}
-      <div className="between learn-actions"><span className="muted">{feedback ? 'Xem đáp án rồi tiếp tục khi bạn sẵn sàng.' : stage === 'typing' ? 'Nhấn Enter để kiểm tra.' : 'Chọn một đáp án để tiếp tục.'}</span>{stage === 'typing' && !feedback && <button className="btn soft" onClick={onSkip}>Chưa nhớ</button>}{feedback && <button className="btn primary" onClick={onNext}>Tiếp tục <ArrowRight /></button>}{stage === 'typing' && !feedback && <button className="btn primary" disabled={!answer.trim()} onClick={onSubmit}>Kiểm tra <ArrowRight /></button>}</div>
+    <div className="panel learn-panel">
+      <div className="learn-question"><div className="between"><span className="eyebrow">Từ</span><span className={`stage-pill ${stage}`}>{stage === 'choice' ? 'Bước 1 · Chọn đáp án' : 'Bước 2 · Tự gõ lại'}</span></div><div className="learn-word">{card.term}</div></div>
+      <p className="learn-prompt">{stage === 'choice' ? 'Chọn nghĩa đúng' : 'Gõ nghĩa'}</p>
+      {stage === 'choice' ? <div className="learn-options">{options.map((option, i) => { const isRight = feedback && normalizeAnswer(option) === normalizeAnswer(expected); const isWrong = feedback && !isRight && option === choice; return <button key={`${option}-${i}`} className={`answer-option ${isRight ? 'correct' : isWrong ? 'wrong' : ''}`} disabled={!!feedback} onClick={() => onChoice(option)}><span className="option-key">{isRight ? <Check size={14} /> : isWrong ? <X size={14} /> : i + 1}</span><span>{option}</span></button>; })}</div>
+        : <div className="learn-input"><input className={`input big ${feedback || ''}`} autoFocus aria-label="Câu trả lời của bạn" value={answer} disabled={!!feedback} onChange={e => onAnswer(e.target.value)} onKeyDown={e => e.key === 'Enter' && (feedback ? onNext() : onSubmit())} placeholder="Nhập câu trả lời" /></div>}
+      {feedback && <div className={`learn-feedback ${feedback}`} role="status">{feedback === 'correct' ? <Check size={18} /> : <X size={18} />}<div><strong>{feedback === 'correct' ? 'Chính xác! Làm tốt lắm.' : 'Chưa đúng – bạn sẽ gặp lại từ này.'}</strong>{feedback === 'wrong' && <span>Đáp án đúng: {expected}</span>}</div></div>}
+      <div className="learn-actions">
+        <span className="muted small">{feedback ? 'Nhấn Enter hoặc nút bên cạnh để tiếp tục' : stage === 'typing' ? 'Nhấn Enter để kiểm tra' : `Nhấn phím 1–${options.length} để chọn`}</span>
+        {stage === 'typing' && !feedback && <button className="btn ghost" onClick={onSkip}>Không biết?</button>}
+        {stage === 'typing' && !feedback && <button className="btn primary" disabled={!answer.trim()} onClick={onSubmit}>Trả lời</button>}
+        {feedback && <button className="btn primary" onClick={onNext}>Tiếp tục <ArrowRight /></button>}
+      </div>
+    </div>
+    <p className="muted small learn-meta">{mastered}/{total} từ đã thuộc · {attempts} lượt trả lời</p>
+  </div>;
+}
+
+function FlipCard({ front, back, frontLabel, backLabel, frontHint, backHint, flipped, onFlip, compact }: { front?: string; back?: string; frontLabel: string; backLabel: string; frontHint?: string; backHint?: string; flipped: boolean; onFlip: () => void; compact?: boolean }) {
+  return <div className={`flip ${flipped ? 'is-flipped' : ''} ${compact ? 'compact' : ''}`} role="button" tabIndex={0} aria-pressed={flipped} aria-label={flipped ? `${backLabel}: ${back}. Nhấn để lật lại` : `${frontLabel}: ${front}. Nhấn để lật thẻ`}
+    onClick={onFlip} onKeyDown={e => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); e.stopPropagation(); onFlip(); } }}>
+    <div className="flip-inner">
+      <div className="flip-face front" aria-hidden={flipped}><span className="face-label">{frontLabel}</span><div className="word">{front}</div>{frontHint && <div className="phonetic">{frontHint}</div>}</div>
+      <div className="flip-face back" aria-hidden={!flipped}><span className="face-label">{backLabel}</span><div className="word">{back}</div>{backHint && <p className="hint">{backHint}</p>}</div>
     </div>
   </div>;
 }
 
-function ImportPanel({ setTitle, text, separator, rows, error, busy, existing, onBack, onText, onSeparator, onFile, onPreview, onCommit }: { setTitle: string; text: string; separator: PasteSeparator; rows: CardDraft[]; error: string; busy: boolean; existing: Card[]; onBack: () => void; onText: (value: string) => void; onSeparator: (value: PasteSeparator) => void; onFile: (file: File) => void; onPreview: () => void; onCommit: () => void }) {
-  const seen = new Set(existing.map(c => normalizeAnswer(c.term)));
-  const statuses = rows.map(row => { const key = normalizeAnswer(row.term); if (!key || !row.definition.trim()) return 'missing'; if (seen.has(key)) return 'duplicate'; seen.add(key); return 'ready'; });
-  const ready = statuses.filter(status => status === 'ready').length;
-  return <div className="import-screen"><button className="btn ghost small" onClick={onBack}><ChevronLeft /> {setTitle}</button><div className="welcome" style={{ marginTop: 20 }}><div className="eyebrow">THÊM THẺ HÀNG LOẠT</div><h1>Nhập từ vựng</h1><p>Dán danh sách như trên Quizlet: mỗi dòng một thẻ, từ và nghĩa cách nhau bằng dấu bạn chọn.</p></div>
-    <div className="import-layout"><section className="panel import-editor"><div className="between"><h2>1. Dán nội dung</h2><span className="pill">{text.trim() ? text.trim().split(/\r?\n/).length : 0} dòng</span></div><label className="field"><span>Dấu ngăn giữa từ và nghĩa</span><select className="select" value={separator} onChange={e => onSeparator(e.target.value as PasteSeparator)}><option value="auto">Tự nhận diện</option><option value="tab">Tab</option><option value="comma">Dấu phẩy (,)</option><option value="dash">Dấu gạch ngang (-)</option><option value="colon">Dấu hai chấm (:)</option></select></label><label className="field"><span>Danh sách từ vựng</span><textarea className="textarea import-textarea" value={text} onChange={e => onText(e.target.value)} placeholder={'apple\tquả táo\nbook\tquyển sách\nlearn\thọc tập'} spellCheck={false} /></label><div className="between import-editor-footer"><span className="muted">Mỗi thẻ nằm trên một dòng riêng.</span><button className="btn primary" disabled={!text.trim()} onClick={onPreview}>Xem trước <ArrowRight /></button></div><div className="import-divider"><span>hoặc tải tệp lên</span></div><label className="import-file"><FileUp size={21} /><span><strong>Chọn tệp CSV, TSV, JSON hoặc Excel</strong><small>Tối đa 8 MB</small></span><input type="file" accept=".csv,.tsv,.txt,.json,.xlsx,.xls" onChange={e => { const file = e.target.files?.[0]; if (file) onFile(file); e.target.value = ''; }} /></label></section>
-    <aside className="panel import-help"><div className="eyebrow">MẪU DỮ LIỆU</div><h2>Hai cột là đủ</h2><p className="muted">Bạn có thể sao chép trực tiếp hai cột từ bảng tính hoặc từ màn hình nhập của Quizlet.</p><div className="import-example"><span>TỪ / THUẬT NGỮ</span><span>NGHĨA / ĐỊNH NGHĨA</span><strong>serendipity</strong><strong>sự tình cờ thú vị</strong><strong>resilient</strong><strong>kiên cường</strong></div><p className="muted">Tệp có thể chứa thêm phiên âm, ví dụ và ghi chú.</p></aside></div>
-    {error && <div className="import-alert" role="alert">{error}</div>}
-    {rows.length > 0 && <section className="panel import-preview"><div className="between mobile-stack"><div><div className="eyebrow">KIỂM TRA TRƯỚC KHI LƯU</div><h2>2. Xem trước thẻ</h2><p className="muted">{ready} sẵn sàng · {rows.length - ready} thiếu dữ liệu hoặc trùng trong phần đã tải</p></div><button className="btn primary" disabled={!ready || busy} onClick={onCommit}><UploadCloud /> {busy ? 'Đang nhập...' : `Nhập ${ready} thẻ`}</button></div><div className="table-scroll"><table className="card-table"><thead><tr><th>Từ / thuật ngữ</th><th>Nghĩa / định nghĩa</th><th>Trạng thái</th></tr></thead><tbody>{rows.slice(0, 30).map((row, i) => <tr key={i}><td><strong>{row.term || '—'}</strong></td><td>{row.definition || '—'}</td><td><span className={`import-status ${statuses[i]}`}>{statuses[i] === 'ready' ? 'Sẵn sàng' : statuses[i] === 'duplicate' ? 'Trùng từ' : 'Thiếu nội dung'}</span></td></tr>)}</tbody></table></div>{rows.length > 30 && <p className="muted">Đang hiển thị 30/{rows.length} thẻ.</p>}</section>}
-  </div>;
+function SetPreview({ cards, onExpand, onSpeak }: { cards: Card[]; onExpand: () => void; onSpeak: (text: string) => void }) {
+  const [i, setI] = useState(0);
+  const [flipped, setFlipped] = useState(false);
+  const card = cards[Math.min(i, cards.length - 1)];
+  const go = (next: number) => { setI(next); setFlipped(false); };
+  return <section className="set-preview" aria-label="Xem nhanh thẻ ghi nhớ">
+    <FlipCard compact flipped={flipped} onFlip={() => setFlipped(v => !v)} frontLabel="Từ" backLabel="Nghĩa" front={card.term} back={card.definition} frontHint={card.phonetic} backHint={card.example} />
+    <div className="preview-bar">
+      <button className="icon-button plain" aria-label="Nghe phát âm" onClick={() => onSpeak(card.term)}><Volume2 size={18} /></button>
+      <div className="row"><button className="icon-button round" aria-label="Thẻ trước" disabled={i === 0} onClick={() => go(i - 1)}><ChevronLeft /></button><span className="fc-count">{i + 1} / {cards.length}</span><button className="icon-button round" aria-label="Thẻ tiếp" disabled={i >= cards.length - 1} onClick={() => go(i + 1)}><ChevronRight /></button></div>
+      <button className="icon-button plain" aria-label="Mở to để học" title="Mở to để học" onClick={onExpand}><Maximize2 size={17} /></button>
+    </div>
+  </section>;
 }
 
-function Stat({ icon: Icon, label, value, caption, tint, color }: { icon: typeof BookOpen; label: string; value: number | string; caption: string; tint: string; color: string }) { return <div className="stat-card"><div className="stat-top"><span>{label}</span><span className="stat-icon" style={{ background: tint, color }}><Icon size={18} /></span></div><div className="stat-number">{value}</div><div className="stat-caption">{caption}</div></div>; }
-function SetCard({ set, onClick }: { set: SetRecord; onClick: () => void }) { return <button className="set-card" onClick={onClick}><div className={`set-art ${set.cover_color || 'violet'}`}><BookOpen /></div><h3>{set.title}</h3><p>{set.description || `${set.source_language} → ${set.target_language}`}</p><div className="set-meta"><span>{set.card_count || 0} từ vựng</span><span>{set.visibility === 'public' ? 'Công khai' : 'Riêng tư'}</span></div></button>; }
-function Empty({ title, text, action, onClick }: { title: string; text: string; action: string; onClick: () => void }) { return <div className="empty"><BookOpen size={35} /><h3>{title}</h3><p>{text}</p><Button onClick={onClick}>{action} <ArrowRight /></Button></div>; }
-function Result({ correct, total, onAgain, onBack }: { correct: number; total: number; onAgain: () => void; onBack: () => void }) { return <div className="panel" style={{ textAlign: 'center', padding: 45 }}><div className="mode-icon" style={{ background: '#e8f7ef', color: '#3daa7d', margin: '0 auto 18px' }}><Trophy /></div><div className="eyebrow">HOÀN THÀNH</div><h1>Giỏi lắm!</h1><p className="muted">Bạn đã hoàn thành lượt học này.</p><div className="stat-number">{correct}/{total}</div><p className="muted">câu trả lời đúng</p><div className="study-controls"><button className="btn" onClick={onBack}>Quay lại</button><button className="btn primary" onClick={onAgain}><RotateCcw /> Học lại</button></div></div>; }
-function DiscoverPanel({ sets, total, onOpen, onMore, onCreate }: { sets: SetRecord[]; total: number; onOpen: (id: string) => void; onMore: () => void; onCreate: () => void }) { return <><div className="welcome"><div className="eyebrow">HỌC CÙNG CỘNG ĐỒNG</div><h1>Khám phá bộ từ</h1><p>Tìm thêm cảm hứng từ những bộ từ được chia sẻ công khai.</p></div><div className="between section-heading"><h2>Bộ từ công khai</h2><span className="muted">{total} bộ từ</span></div>{sets.length ? <div className="set-grid">{sets.map(s => <SetCard key={s.id} set={s} onClick={() => onOpen(s.id)} />)}</div> : <Empty title="Chưa có bộ từ công khai" text="Hãy tạo bộ từ và bật quyền xem công khai để chia sẻ." action="Tạo bộ từ" onClick={onCreate} />}{sets.length < total && <div style={{ textAlign: 'center', marginTop: 22 }}><button className="btn" onClick={onMore}>Tải thêm <ChevronRight /></button></div>}</>; }
-function ActivityChart({ days, height }: { days: { label: string; value: number }[]; height: number }) { return <div style={{ width: '100%', height }}><ResponsiveContainer width="100%" height="100%"><BarChart data={days} margin={{ top: 10, right: 0, bottom: 0, left: 0 }}><XAxis dataKey="label" axisLine={false} tickLine={false} tick={{ fill: '#9295a7', fontSize: 11 }} /><Tooltip cursor={{ fill: '#f0eeff' }} contentStyle={{ background: 'var(--panel)', border: '1px solid var(--line)', borderRadius: 10, color: 'var(--ink)' }} formatter={(value) => [`${value} lượt`, 'Luyện tập']} /><Bar dataKey="value" fill="#6657e9" radius={[6, 6, 2, 2]} maxBarSize={35} /></BarChart></ResponsiveContainer></div>; }
-function FolderBar({ folders, selected, onSelect, onAdd, onEdit, onDelete }: { folders: Folder[]; selected: string; onSelect: (id: string) => void; onAdd: () => void; onEdit: (folder: Folder) => void; onDelete: (folder: Folder) => void }) { return <div className="panel" style={{ marginBottom: 20 }}><div className="between" style={{ marginBottom: 14 }}><h3 style={{ margin: 0 }}>Thư mục</h3><button className="btn soft small" onClick={onAdd}><Plus /> Tạo thư mục</button></div><div className="row" style={{ overflowX: 'auto', paddingBottom: 3 }}><button className={`btn small ${selected === 'all' ? 'soft' : ''}`} onClick={() => onSelect('all')}><FolderOpen /> Tất cả</button>{folders.map(folder => <div className="row" key={folder.id} style={{ gap: 3, flexShrink: 0 }}><button className={`btn small ${selected === folder.id ? 'soft' : ''}`} onClick={() => onSelect(folder.id)}><FolderOpen /> {folder.name}</button><button className="icon-button" title={`Sửa ${folder.name}`} style={{ width: 30, height: 30 }} onClick={() => onEdit(folder)}><Pencil size={13} /></button><button className="icon-button" title={`Xóa ${folder.name}`} style={{ width: 30, height: 30 }} onClick={() => onDelete(folder)}><Trash2 size={13} /></button></div>)}</div></div>; }
-function SharedPanel({ sets, total, onOpen, onMore }: { sets: SetRecord[]; total: number; onOpen: (id: string) => void; onMore: () => void }) { return <><div className="welcome"><div className="eyebrow">HỌC CÙNG NHAU</div><h1>Được chia sẻ với bạn</h1><p>Những bộ từ mà bạn bè hoặc giáo viên đã mời bạn cùng học.</p></div><div className="between section-heading"><h2>Bộ từ được chia sẻ</h2><span className="muted">{total} bộ từ</span></div>{sets.length ? <div className="set-grid">{sets.map(s => <SetCard key={s.id} set={s} onClick={() => onOpen(s.id)} />)}</div> : <div className="empty"><Globe2 size={35} /><h3>Chưa có bộ từ được chia sẻ</h3><p>Khi bạn nhận lời mời qua liên kết, bộ từ sẽ xuất hiện ở đây.</p></div>}{sets.length < total && <div style={{ textAlign: 'center', marginTop: 22 }}><button className="btn" onClick={onMore}>Tải thêm <ChevronRight /></button></div>}</>; }
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
+function Stat({ icon: Icon, label, value, caption, tone }: { icon: typeof BookOpen; label: string; value: number | string; caption: string; tone: Tone }) { return <div className={`stat-card ${tone}`}><div className="stat-top"><span>{label}</span><span className={`tone-icon sm ${tone}`}><Icon size={16} /></span></div><div className="stat-number">{value}</div><div className="stat-caption">{caption}</div></div>; }
+function SetCard({ set, onClick }: { set: SetRecord; onClick: () => void }) { return <button className="set-card" onClick={onClick}><div className={`set-art ${set.cover_color || 'violet'}`}><BookOpen /></div><h3>{set.title}</h3><p>{set.description || `${set.source_language} → ${set.target_language}`}</p><div className="set-meta"><span className="pill">{set.card_count || 0} thẻ</span><span>{set.visibility === 'public' ? 'Công khai' : 'Riêng tư'}</span></div></button>; }
+function Empty({ title, text, action, onClick }: { title: string; text: string; action: string; onClick: () => void }) { return <div className="empty"><span className="tone-icon violet"><BookOpen size={22} /></span><h3>{title}</h3><p>{text}</p><Button onClick={onClick}>{action} <ArrowRight /></Button></div>; }
+function Result({ correct, total, onAgain, onBack, extra }: { correct: number; total: number; onAgain: () => void; onBack: () => void; extra?: string }) { const pct = Math.round(correct / Math.max(1, total) * 100); return <div className="panel result"><span className="tone-icon green big"><Trophy size={26} /></span><h1>{pct >= 80 ? 'Xuất sắc!' : pct >= 50 ? 'Làm tốt lắm!' : 'Tiếp tục cố gắng nhé!'}</h1><p className="muted">Bạn đã hoàn thành lượt học này.</p><div className="result-score"><strong>{correct}/{total}</strong><span>đúng · {pct}%</span></div>{extra && <p className="muted small">{extra}</p>}<div className="study-controls"><button className="btn" onClick={onBack}>Quay lại bộ từ</button><button className="btn primary" onClick={onAgain}><RotateCcw /> Học lại</button></div></div>; }
+function DiscoverPanel({ searchBox, sets, total, onOpen, onMore, onCreate }: { searchBox: React.ReactNode; sets: SetRecord[]; total: number; onOpen: (id: string) => void; onMore: () => void; onCreate: () => void }) { return <><div className="welcome"><h1>Khám phá bộ từ</h1><p>{total} bộ từ được chia sẻ công khai bởi mọi người.</p></div>{searchBox}{sets.length ? <div className="set-grid">{sets.map(s => <SetCard key={s.id} set={s} onClick={() => onOpen(s.id)} />)}</div> : <Empty title="Chưa có bộ từ công khai" text="Hãy tạo bộ từ và chọn “Mọi người” ở quyền xem để chia sẻ." action="Tạo bộ từ" onClick={onCreate} />}{sets.length < total && <div className="center-row"><button className="btn" onClick={onMore}>Tải thêm <ChevronRight /></button></div>}</>; }
+function ActivityChart({ days, height }: { days: { label: string; value: number }[]; height: number }) { return <div style={{ width: '100%', height, marginTop: 12 }}><ResponsiveContainer width="100%" height="100%"><BarChart data={days} margin={{ top: 10, right: 0, bottom: 0, left: 0 }}><XAxis dataKey="label" axisLine={false} tickLine={false} tick={{ fill: 'var(--muted)', fontSize: 12 }} /><Tooltip cursor={{ fill: 'var(--soft)' }} contentStyle={{ background: 'var(--panel)', border: '1px solid var(--line)', borderRadius: 10, color: 'var(--ink)' }} formatter={(value) => [`${value} từ`, 'Đã học']} /><Bar dataKey="value" fill="var(--chart)" radius={[8, 8, 3, 3]} maxBarSize={34} /></BarChart></ResponsiveContainer></div>; }
+function FolderBar({ folders, selected, onSelect, onAdd, onEdit, onDelete }: { folders: Folder[]; selected: string; onSelect: (id: string) => void; onAdd: () => void; onEdit: (folder: Folder) => void; onDelete: (folder: Folder) => void }) {
+  const current = folders.find(f => f.id === selected);
+  return <div className="folder-bar">
+    <div className="chips" role="tablist" aria-label="Thư mục">
+      <button role="tab" aria-selected={selected === 'all'} className={`chip ${selected === 'all' ? 'on' : ''}`} onClick={() => onSelect('all')}>Tất cả</button>
+      {folders.map(folder => <button role="tab" aria-selected={selected === folder.id} key={folder.id} className={`chip ${selected === folder.id ? 'on' : ''}`} onClick={() => onSelect(folder.id)}><FolderOpen size={14} /> {folder.name}</button>)}
+      <button className="chip add" onClick={onAdd}><Plus size={14} /> Thư mục</button>
+    </div>
+    {current && <div className="row"><button className="btn ghost small" onClick={() => onEdit(current)}><Pencil /> Đổi tên</button><button className="btn ghost small danger" onClick={() => onDelete(current)}><Trash2 /> Xóa thư mục</button></div>}
+  </div>;
+}
+function SharedPanel({ sets, total, onOpen, onMore }: { sets: SetRecord[]; total: number; onOpen: (id: string) => void; onMore: () => void }) { return <><div className="welcome"><h1>Được chia sẻ với bạn</h1><p>{total} bộ từ mà bạn bè hoặc giáo viên đã mời bạn cùng học.</p></div>{sets.length ? <div className="set-grid">{sets.map(s => <SetCard key={s.id} set={s} onClick={() => onOpen(s.id)} />)}</div> : <div className="empty"><span className="tone-icon violet"><Users size={22} /></span><h3>Chưa có bộ từ được chia sẻ</h3><p>Khi bạn nhận lời mời qua liên kết, bộ từ sẽ xuất hiện ở đây.</p></div>}{sets.length < total && <div className="center-row"><button className="btn" onClick={onMore}>Tải thêm <ChevronRight /></button></div>}</>; }

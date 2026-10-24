@@ -5,3 +5,5 @@ export type Session = { id: string; set_id: string; mode: string; correct: numbe
 export type Profile = { id: string; display_name: string; learning_language: string; daily_goal: number };
 export type Folder = { id: string; owner_id: string; name: string; created_at: string };
 export type AppData = { sets: SetRecord[]; cards: Card[]; sessions: Session[]; profile: Profile | null; folders?: Folder[] };
+export type SetDraft = Pick<SetRecord, 'title' | 'description' | 'source_language' | 'target_language' | 'visibility' | 'tags' | 'cover_color' | 'folder_id'>;
+export type CardDraft = Pick<Card, 'term' | 'definition' | 'phonetic' | 'example' | 'example_translation' | 'notes' | 'synonyms' | 'antonyms'>;

@@ -1,5 +1,5 @@
-import type { Card } from './types';
-type CardDraft = Pick<Card, 'term' | 'definition' | 'phonetic' | 'example' | 'example_translation' | 'notes' | 'synonyms' | 'antonyms'>;
+import type { CardDraft } from './types';
+
 
 export function parseDelimited(text: string): CardDraft[] {
   const firstLine = text.split(/\r?\n/, 1)[0];
@@ -29,23 +29,20 @@ export function parseDelimited(text: string): CardDraft[] {
   }).filter(r => r.term || r.definition);
 }
 
-export type PasteSeparator = 'auto' | 'tab' | 'comma' | 'dash' | 'colon';
+/** Separators offered by Quizlet's "Import" dialog. `custom` uses the accompanying string. */
+export type TermSeparator = 'tab' | 'comma' | 'custom';
+export type CardSeparator = 'newline' | 'semicolon' | 'custom';
+export type ImportOptions = { term: TermSeparator; card: CardSeparator; customTerm?: string; customCard?: string };
 
-/** Parse the two-column list copied from Quizlet's import box. */
-export function parseQuizletPaste(text: string, separator: PasteSeparator = 'auto'): CardDraft[] {
-  const lines = text.replace(/^\uFEFF/, '').split(/\r?\n/).filter(line => line.trim());
-  if (!lines.length) return [];
-  const selected = separator === 'auto'
-    ? lines[0].includes('\t') ? 'tab' : lines[0].includes(' — ') || lines[0].includes(' - ') ? 'dash' : lines[0].includes(': ') ? 'colon' : lines[0].includes(',') ? 'comma' : 'tab'
-    : separator;
-  if (selected === 'tab' || selected === 'comma') {
-    if (selected === 'tab' && !lines[0].includes('\t')) throw new Error('Không tìm thấy dấu tab giữa từ và nghĩa.');
-    if (selected === 'comma' && !lines[0].includes(',')) throw new Error('Không tìm thấy dấu phẩy giữa từ và nghĩa.');
-    return parseDelimited(text);
-  }
-  const delimiter = selected === 'colon' ? ':' : lines[0].includes(' — ') ? ' — ' : ' - ';
-  return lines.map(line => {
-    const at = line.indexOf(delimiter);
-    return { term: at < 0 ? line.trim() : line.slice(0, at).trim(), definition: at < 0 ? '' : line.slice(at + delimiter.length).trim(), phonetic: '', example: '', example_translation: '', notes: '', synonyms: '', antonyms: '' };
+/** Parse text pasted into the import box exactly like Quizlet: split into cards, then split each card once into term/definition. */
+export function parseImport(text: string, options: ImportOptions): { term: string; definition: string }[] {
+  const source = text.replace(/^\uFEFF/, '').replace(/\r\n?/g, '\n');
+  const unescape = (value = '') => value.replace(/\\n/g, '\n').replace(/\\t/g, '\t');
+  const termSep = options.term === 'tab' ? '\t' : options.term === 'comma' ? ',' : unescape(options.customTerm);
+  const cardSep = options.card === 'newline' ? '\n' : options.card === 'semicolon' ? ';' : unescape(options.customCard);
+  if (!termSep || !cardSep) return [];
+  return source.split(cardSep).filter(chunk => chunk.trim()).map(chunk => {
+    const at = chunk.indexOf(termSep);
+    return at < 0 ? { term: chunk.trim(), definition: '' } : { term: chunk.slice(0, at).trim(), definition: chunk.slice(at + termSep.length).trim() };
   });
 }
