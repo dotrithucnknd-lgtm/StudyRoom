@@ -35,6 +35,31 @@ function formatDate(value: string) { return new Intl.DateTimeFormat('vi-VN', { d
 function pronounce(text: string, language = 'English') { if (!('speechSynthesis' in window)) return false; speechSynthesis.cancel(); const u = new SpeechSynthesisUtterance(text); u.lang = language.includes('日本') || language.toLowerCase().includes('japan') ? 'ja-JP' : language.toLowerCase().includes('chinese') ? 'zh-CN' : 'en-US'; u.rate = .88; speechSynthesis.speak(u); return true; }
 function download(name: string, content: string, mime: string) { const blob = new Blob(['\uFEFF', content], { type: mime }); const url = URL.createObjectURL(blob); const a = document.createElement('a'); a.href = url; a.download = name; a.click(); URL.revokeObjectURL(url); }
 function csvEscape(v: string, delimiter: string) { return `"${String(v).replaceAll('"', '""')}"`; }
+/** Each page has its own address so links, reloads and the Back button work. */
+const pagePaths: Partial<Record<View, string>> = { dashboard: '/', library: '/library', shared: '/shared', discover: '/discover', stats: '/stats', settings: '/settings' };
+/** Set ids are UUIDs (demo sets use short ids like "demo-1"); the API checks them strictly. */
+const UUID = /^[\w-]{1,64}$/;
+function parsePath(path: string): { view: View; setId: string | null } {
+  const parts = path.split('/').filter(Boolean);
+  if (parts[0] === 'set' && parts[1] && UUID.test(parts[1])) {
+    if (!parts[2]) return { view: 'set', setId: parts[1] };
+    if (parts[2] === 'edit') return { view: 'editor', setId: parts[1] };
+    if (studyViews.includes(parts[2] as View)) return { view: parts[2] as View, setId: parts[1] };
+  }
+  if (parts.length === 1) {
+    if (parts[0] === 'review') return { view: 'review', setId: null };
+    if (parts[0] === 'create') return { view: 'editor', setId: null };
+    const hit = (Object.keys(pagePaths) as View[]).find(v => pagePaths[v] === `/${parts[0]}`);
+    if (hit) return { view: hit, setId: null };
+  }
+  return { view: 'dashboard', setId: null };
+}
+function pathFor(view: View, setId: string | null, editorSetId?: string | null) {
+  if (view === 'editor') return editorSetId ? `/set/${editorSetId}/edit` : '/create';
+  if (view === 'set') return setId ? `/set/${setId}` : '/library';
+  if (studyViews.includes(view)) return setId ? `/set/${setId}/${view}` : view === 'review' ? '/review' : '/';
+  return pagePaths[view] || '/';
+}
 function useToast() { const [message, setMessage] = useState(''); useEffect(() => { if (!message) return; const t = setTimeout(() => setMessage(''), 4000); return () => clearTimeout(t); }, [message]); return { message, toast: setMessage }; }
 
 export default function Page() {
@@ -104,6 +129,18 @@ export default function Page() {
   const [authEmail, setAuthEmail] = useState('');
   const [authPassword, setAuthPassword] = useState('');
   const { message, toast } = useToast();
+  /** True while a study mode is loading its cards, so the screen shows a placeholder instead of an empty deck. */
+  const [preparing, setPreparing] = useState(false);
+  const [menuOpen, setMenuOpen] = useState(false);
+  const menuRef = useRef<HTMLDivElement>(null);
+  /** Every card of a set, loaded once and reused by all study modes so opening one is instant. */
+  const cardCache = useRef(new Map<string, Card[]>());
+  const cardFetches = useRef(new Map<string, Promise<Card[]>>());
+  /** Bumped whenever a study mode starts or is left, so a slow load can't reopen a mode the user already left. */
+  const modeToken = useRef(0);
+  const routeReady = useRef(false);
+  const routing = useRef(false);
+  const initialRouted = useRef(false);
   const activeSet = data.sets.find(s => s.id === selectedId) || discoveredSets.find(s => s.id === selectedId) || sharedSets.find(s => s.id === selectedId) || null;
   const ownsActiveSet = Boolean(activeSet && (demo || activeSet.owner_id === userId));
   const canEditActiveCards = ownsActiveSet || activeSet?.access_role === 'editor';
@@ -124,7 +161,7 @@ export default function Page() {
     if (new URLSearchParams(location.search).get('demo') === '1') setDemo(true);
     const client = supabase();
     if (!client) { setAuthReady(true); return; }
-    if (location.search.includes('code=')) client.auth.exchangeCodeForSession(new URLSearchParams(location.search).get('code') || '').then(() => history.replaceState({}, '', '/'));
+    if (location.search.includes('code=')) client.auth.exchangeCodeForSession(new URLSearchParams(location.search).get('code') || '').then(() => history.replaceState({}, '', location.pathname));
     client.auth.getUser().then(({ data: result }) => {
       setUserId(result.user?.id || null); setAuthReady(true);
       // Google sign-in returns tokens in the URL hash; drop them so they can't be copied or shared by accident.
@@ -158,7 +195,12 @@ export default function Page() {
   const loadCards = useCallback(async (setId: string, page = 0) => {
     if (demo) return;
     setLoading(true);
-    try { const result = await api(`cards?set=${setId}&page=${page}`); setData(d => ({ ...d, cards: [...d.cards.filter(c => c.set_id !== setId), ...result.cards] })); setCardTotal(result.total || 0); setCardPage(page); }
+    try {
+      const result = await api(`cards?set=${setId}&page=${page}`); setData(d => ({ ...d, cards: [...d.cards.filter(c => c.set_id !== setId), ...result.cards] })); setCardTotal(result.total || 0); setCardPage(page);
+      // Small sets are already complete; for bigger ones, load the rest in the background so "Học" opens instantly.
+      if (page === 0 && (result.total || 0) <= result.cards.length) { if (!cardFetches.current.has(setId)) cardCache.current.set(setId, result.cards); }
+      else if (page === 0) void cardsOf(setId).catch(() => undefined);
+    }
     catch (e) { toast((e as Error).message); } finally { setLoading(false); }
   }, [api, demo, toast]);
   async function loadMoreSets() { try { const page = setsPage + 1; const result = await api(`sets?page=${page}`); setData(d => ({ ...d, sets: [...d.sets, ...result.sets] })); setSetsPage(page); } catch (e) { toast((e as Error).message); } }
@@ -166,8 +208,8 @@ export default function Page() {
   useEffect(() => { if (view === 'shared') loadShared(0); }, [view, demo]);
   async function loadDiscover(page = 0, query = '') { if (demo) { const rows = data.sets.filter(s => s.visibility === 'public' && s.title.toLowerCase().includes(query.toLowerCase())); setDiscoveredSets(rows); setDiscoveredTotal(rows.length); return; } try { const result = await api(`sets?scope=public&page=${page}&q=${encodeURIComponent(query)}`); setDiscoveredSets(old => page ? [...old, ...result.sets] : result.sets); setDiscoveredTotal(result.total || 0); setDiscoveredPage(page); } catch (e) { toast((e as Error).message); } }
   useEffect(() => { if (view !== 'discover') return; const timer = setTimeout(() => loadDiscover(0, search), 250); return () => clearTimeout(timer); }, [view, search, demo, data.sets]);
-  useEffect(() => { if (!userId || demo) return; const id = new URLSearchParams(location.search).get('set'); if (!id) return; api(`sets?id=${encodeURIComponent(id)}`).then(result => { const set = result.sets?.[0]; if (!set) throw new Error('Bộ từ không tồn tại hoặc bạn không có quyền xem.'); setDiscoveredSets(old => old.some(s => s.id === set.id) ? old : [set, ...old]); setSelectedId(set.id); setView('set'); loadCards(set.id); history.replaceState({}, '', '/'); }).catch(e => toast((e as Error).message)); }, [userId, demo]);
-  useEffect(() => { if (!userId || demo) return; const token = new URLSearchParams(location.search).get('invite'); if (!token) return; api('shares', 'PATCH', { token }).then(async result => { const sets = await api(`sets?id=${result.set_id}`); const set = sets.sets?.[0]; if (!set) throw new Error('Không thể mở bộ từ vừa được chia sẻ.'); setSharedSets(old => old.some(s => s.id === set.id) ? old : [set, ...old]); setSelectedId(set.id); setView('set'); loadCards(set.id); history.replaceState({}, '', '/'); toast('Đã nhận lời mời chia sẻ.'); }).catch(e => toast((e as Error).message)); }, [userId, demo]);
+  useEffect(() => { if (!userId || demo) return; const id = new URLSearchParams(location.search).get('set'); if (!id) return; api(`sets?id=${encodeURIComponent(id)}`).then(result => { const set = result.sets?.[0]; if (!set) throw new Error('Bộ từ không tồn tại hoặc bạn không có quyền xem.'); setDiscoveredSets(old => old.some(s => s.id === set.id) ? old : [set, ...old]); setSelectedId(set.id); setView('set'); loadCards(set.id); history.replaceState({}, '', `/set/${set.id}`); }).catch(e => toast((e as Error).message)); }, [userId, demo]);
+  useEffect(() => { if (!userId || demo) return; const token = new URLSearchParams(location.search).get('invite'); if (!token) return; api('shares', 'PATCH', { token }).then(async result => { const sets = await api(`sets?id=${result.set_id}`); const set = sets.sets?.[0]; if (!set) throw new Error('Không thể mở bộ từ vừa được chia sẻ.'); setSharedSets(old => old.some(s => s.id === set.id) ? old : [set, ...old]); setSelectedId(set.id); setView('set'); loadCards(set.id); history.replaceState({}, '', `/set/${set.id}`); toast('Đã nhận lời mời chia sẻ.'); }).catch(e => toast((e as Error).message)); }, [userId, demo]);
   useEffect(() => { if (demo && data.profile) { setProfileName(data.profile.display_name); setDailyGoal(data.profile.daily_goal); setLearningLanguage(data.profile.learning_language); } }, [demo, data.profile]);
   /** Leaving the editor with unsaved edits to an existing set needs confirmation; new-set drafts are autosaved. */
   function canLeaveEditor() { if (view !== 'editor' || !editorDirty.current || editor?.mode === 'create') return true; if (!confirm('Bỏ các thay đổi chưa lưu?')) return false; editorDirty.current = false; return true; }
@@ -181,7 +223,7 @@ export default function Page() {
     editorDirty.current = false;
     if (!set) { setEditor({ mode: 'create', setId: null, set: { ...emptySet, folder_id: folderFilter === 'all' ? null : folderFilter }, cards: [], original: [], focusKey: null, openImport: Boolean(options.importing), returnTo: view === 'editor' ? 'library' : view }); setView('editor'); return; }
     let source = data.cards.filter(c => c.set_id === set.id);
-    if (!demo && (set.card_count || 0) > source.length) { setLoading(true); try { source = await fetchAllCards(set.id); } catch (e) { toast((e as Error).message); return; } finally { setLoading(false); } }
+    if (!demo && (set.card_count || 0) > source.length) { setLoading(true); try { source = await cardsOf(set.id); } catch (e) { toast((e as Error).message); return; } finally { setLoading(false); } }
     source = [...source].sort((a, b) => a.position - b.position);
     const rows: EditorCard[] = source.map(c => ({ ...pickCard(c), key: c.id, id: c.id }));
     let focusKey = options.focus || null;
@@ -240,6 +282,7 @@ export default function Page() {
           updateData(d => ({ ...d, sets: d.sets.map(bump) }));
           setSharedSets(list => list.map(bump)); setDiscoveredSets(list => list.map(bump));
           if (ownsSet) setOverview(o => ({ ...o, cards: Math.max(0, o.cards + created.length - removed.length) }));
+          dropCached(setId);
           await loadCards(setId, 0);
         }
         setCardTotal(rows.length);
@@ -250,7 +293,7 @@ export default function Page() {
       return true;
     } catch (e) {
       toast(`Không lưu được: ${(e as Error).message}`);
-      if (!demo && editor.mode === 'edit' && editor.setId) void loadCards(editor.setId, 0);
+      if (!demo && editor.mode === 'edit' && editor.setId) { dropCached(editor.setId); void loadCards(editor.setId, 0); }
       return false;
     } finally { setEditorSaving(false); setSaveProgress(''); }
   }
@@ -262,13 +305,13 @@ export default function Page() {
   async function deleteFolder(folder: Folder) { if (!confirm(`Xóa thư mục “${folder.name}”? Các bộ từ trong thư mục sẽ được chuyển ra ngoài.`)) return; try { if (!demo) await api(`folders?id=${folder.id}`, 'DELETE'); updateData(d => ({ ...d, folders: (d.folders || []).filter(f => f.id !== folder.id), sets: d.sets.map(s => s.folder_id === folder.id ? { ...s, folder_id: null } : s) })); setFolderFilter('all'); toast('Đã xóa thư mục.'); } catch (e) { toast((e as Error).message); } }
   async function deleteSet(set: SetRecord) {
     if (!confirm(`Xóa bộ “${set.title}” và toàn bộ thẻ? Thao tác này không thể hoàn tác.`)) return;
-    try { if (!demo) await api(`sets?id=${set.id}`, 'DELETE'); updateData(d => ({ ...d, sets: d.sets.filter(s => s.id !== set.id), cards: d.cards.filter(c => c.set_id !== set.id) })); setSelectedId(null); setView('library'); toast('Đã xóa bộ từ.'); } catch (e) { toast((e as Error).message); }
+    try { if (!demo) await api(`sets?id=${set.id}`, 'DELETE'); dropCached(set.id); updateData(d => ({ ...d, sets: d.sets.filter(s => s.id !== set.id), cards: d.cards.filter(c => c.set_id !== set.id) })); setSelectedId(null); setView('library'); toast('Đã xóa bộ từ.'); } catch (e) { toast((e as Error).message); }
   }
-  async function deleteCard(card: Card) { if (!confirm(`Xóa thẻ “${card.term}”?`)) return; try { if (!demo) await api(`cards?id=${card.id}`, 'DELETE'); updateData(d => ({ ...d, cards: d.cards.filter(c => c.id !== card.id), sets: d.sets.map(s => s.id === card.set_id ? { ...s, card_count: Math.max(0, (s.card_count || 0) - 1) } : s) })); setCardTotal(n => Math.max(0, n - 1)); if (!demo) setOverview(o => ({ ...o, cards: Math.max(0, o.cards - 1), mastered: Math.max(0, o.mastered - Number(card.progress?.state === 'mastered')) })); toast('Đã xóa thẻ.'); } catch (e) { toast((e as Error).message); } }
-  async function toggleCard(card: Card, field: 'favorite' | 'difficult' | 'mastered') { try { if (!demo) await api('cards', 'PATCH', { id: card.id, [field]: !card[field] }); updateData(d => ({ ...d, cards: d.cards.map(c => c.id === card.id ? { ...c, [field]: !card[field] } : c) })); } catch (e) { toast((e as Error).message); } }
+  async function deleteCard(card: Card) { if (!confirm(`Xóa thẻ “${card.term}”?`)) return; try { if (!demo) await api(`cards?id=${card.id}`, 'DELETE'); patchCached(card.set_id, rows => rows.filter(c => c.id !== card.id)); updateData(d => ({ ...d, cards: d.cards.filter(c => c.id !== card.id), sets: d.sets.map(s => s.id === card.set_id ? { ...s, card_count: Math.max(0, (s.card_count || 0) - 1) } : s) })); setCardTotal(n => Math.max(0, n - 1)); if (!demo) setOverview(o => ({ ...o, cards: Math.max(0, o.cards - 1), mastered: Math.max(0, o.mastered - Number(card.progress?.state === 'mastered')) })); toast('Đã xóa thẻ.'); } catch (e) { toast((e as Error).message); } }
+  async function toggleCard(card: Card, field: 'favorite' | 'difficult' | 'mastered') { try { if (!demo) await api('cards', 'PATCH', { id: card.id, [field]: !card[field] }); patchCached(card.set_id, rows => rows.map(c => c.id === card.id ? { ...c, [field]: !card[field] } : c)); updateData(d => ({ ...d, cards: d.cards.map(c => c.id === card.id ? { ...c, [field]: !card[field] } : c) })); } catch (e) { toast((e as Error).message); } }
   async function duplicateSet(set: SetRecord) {
     try {
-      const sourceCards = demo ? data.cards.filter(c => c.set_id === set.id) : await fetchAllCards(set.id);
+      const sourceCards = await cardsOf(set.id);
       const copy = { ...set, title: `${set.title} (bản sao)`, visibility: 'private' as const, folder_id: null };
       let id: string;
       if (demo) id = crypto.randomUUID(); else id = (await api('sets', 'POST', { title: copy.title, description: copy.description, source_language: copy.source_language, target_language: copy.target_language, visibility: 'private', tags: copy.tags, cover_color: copy.cover_color })).id;
@@ -278,20 +321,50 @@ export default function Page() {
       toast('Đã nhân bản bộ từ.');
     } catch (e) { toast((e as Error).message); }
   }
-  async function fetchAllCards(setId: string): Promise<Card[]> { const rows: Card[] = []; for (let page = 0; ; page++) { const result = await api(`cards?set=${setId}&page=${page}`); rows.push(...result.cards); if (rows.length >= result.total || !result.cards.length) break; } return rows; }
-  async function exportSet(set: SetRecord, format: 'csv' | 'tsv' | 'json') { try { const cards = demo ? data.cards.filter(c => c.set_id === set.id) : await fetchAllCards(set.id); const fields = ['term', 'definition', 'phonetic', 'example', 'example_translation', 'notes', 'synonyms', 'antonyms'] as const; const content = format === 'json' ? JSON.stringify({ set: { title: set.title, description: set.description, source_language: set.source_language, target_language: set.target_language }, cards: cards.map(c => Object.fromEntries(fields.map(f => [f, c[f]]))) }, null, 2) : [fields.join(format === 'csv' ? ',' : '\t'), ...cards.map(c => fields.map(f => csvEscape(c[f], format === 'csv' ? ',' : '\t')).join(format === 'csv' ? ',' : '\t'))].join('\r\n'); download(`${set.title.replace(/[^\p{L}\p{N}-]+/gu, '-')}.${format}`, content, format === 'json' ? 'application/json' : 'text/plain;charset=utf-8'); } catch (e) { toast((e as Error).message); } }
+  /** Load a whole set in as few requests as possible: one page of up to 1000 cards, then any remaining pages in parallel. */
+  async function fetchAllCards(setId: string): Promise<Card[]> {
+    const size = 1000;
+    const first = await api(`cards?set=${setId}&page=0&size=${size}`);
+    const pages = Math.ceil((first.total || 0) / size);
+    const rest = await Promise.all(Array.from({ length: Math.max(0, pages - 1) }, (_, i) => api(`cards?set=${setId}&page=${i + 1}&size=${size}`)));
+    return [first, ...rest].flatMap(r => r.cards as Card[]);
+  }
+  /** All cards of a set, from the cache when possible; parallel callers share one request. */
+  function cardsOf(setId: string): Promise<Card[]> {
+    if (demo) return Promise.resolve(data.cards.filter(c => c.set_id === setId));
+    const cached = cardCache.current.get(setId); if (cached) return Promise.resolve(cached);
+    const running = cardFetches.current.get(setId); if (running) return running;
+    const request: Promise<Card[]> = fetchAllCards(setId).then(rows => { if (cardFetches.current.get(setId) === request) { cardCache.current.set(setId, rows); cardFetches.current.delete(setId); } return rows; }, e => { if (cardFetches.current.get(setId) === request) cardFetches.current.delete(setId); throw e; });
+    cardFetches.current.set(setId, request);
+    return request;
+  }
+  function patchCached(setId: string, change: (rows: Card[]) => Card[]) { const rows = cardCache.current.get(setId); if (rows) cardCache.current.set(setId, change(rows)); }
+  function dropCached(setId: string) { cardCache.current.delete(setId); cardFetches.current.delete(setId); }
+  async function exportSet(set: SetRecord, format: 'csv' | 'tsv' | 'json') { try { const cards = await cardsOf(set.id); const fields = ['term', 'definition', 'phonetic', 'example', 'example_translation', 'notes', 'synonyms', 'antonyms'] as const; const content = format === 'json' ? JSON.stringify({ set: { title: set.title, description: set.description, source_language: set.source_language, target_language: set.target_language }, cards: cards.map(c => Object.fromEntries(fields.map(f => [f, c[f]]))) }, null, 2) : [fields.join(format === 'csv' ? ',' : '\t'), ...cards.map(c => fields.map(f => csvEscape(c[f], format === 'csv' ? ',' : '\t')).join(format === 'csv' ? ',' : '\t'))].join('\r\n'); download(`${set.title.replace(/[^\p{L}\p{N}-]+/gu, '-')}.${format}`, content, format === 'json' ? 'application/json' : 'text/plain;charset=utf-8'); } catch (e) { toast((e as Error).message); } }
   async function saveSession(mode: Session['mode'], resultCorrect: number, total: number) { const setId = selectedId || deck[0]?.set_id; if (!setId) return; const entry: Session = { id: crypto.randomUUID(), set_id: setId, mode, correct: resultCorrect, total, duration_seconds: Math.max(1, Math.round((Date.now() - studyStart) / 1000)), created_at: new Date().toISOString() }; try { if (!demo) await api('activity', 'POST', { kind: 'session', set_id: setId, mode, correct: resultCorrect, total, duration_seconds: entry.duration_seconds }); updateData(d => ({ ...d, sessions: [entry, ...d.sessions] })); } catch (e) { toast((e as Error).message); } }
-  async function rateCard(card: Card, rating: Rating) { try { const next: Progress = demo ? { ...scheduleReview(card.progress, rating), card_id: card.id, user_id: 'demo' } : await api('activity', 'POST', { kind: 'review', card_id: card.id, rating }); updateData(d => ({ ...d, cards: d.cards.map(c => c.id === card.id ? { ...c, progress: next, mastered: next.state === 'mastered' } : c) })); if (!demo) setOverview(o => ({ ...o, due: Math.max(0, o.due - Number(Boolean(card.progress && new Date(card.progress.due_at) <= new Date()))), mastered: Math.max(0, o.mastered + Number(next.state === 'mastered') - Number(card.progress?.state === 'mastered')) })); } catch (e) { toast((e as Error).message); } }
-  async function beginMode(mode: View, globalReview = false, pool?: Card[]) {
+  async function rateCard(card: Card, rating: Rating) { try { const next: Progress = demo ? { ...scheduleReview(card.progress, rating), card_id: card.id, user_id: 'demo' } : await api('activity', 'POST', { kind: 'review', card_id: card.id, rating }); patchCached(card.set_id, rows => rows.map(c => c.id === card.id ? { ...c, progress: next, mastered: next.state === 'mastered' } : c)); updateData(d => ({ ...d, cards: d.cards.map(c => c.id === card.id ? { ...c, progress: next, mastered: next.state === 'mastered' } : c) })); if (!demo) setOverview(o => ({ ...o, due: Math.max(0, o.due - Number(Boolean(card.progress && new Date(card.progress.due_at) <= new Date()))), mastered: Math.max(0, o.mastered + Number(next.state === 'mastered') - Number(card.progress?.state === 'mastered')) })); } catch (e) { toast((e as Error).message); } }
+  function leaveStudy(to: View) { modeToken.current++; setPreparing(false); setView(to); }
+  async function beginMode(mode: View, globalReview = false, pool?: Card[], setId: string | null = selectedId) {
+    const token = ++modeToken.current;
     setTestPool(pool && mode === 'test' ? pool : null);
-    let source = pool ? pool : mode === 'review' ? (globalReview ? allCards : activeCards).filter(c => !c.progress || new Date(c.progress.due_at) <= new Date()) : activeCards;
-    if (mode === 'review' && globalReview) { setSelectedId(null); if (!demo) { try { source = []; for (let page = 0; ; page++) { const result = await api(`review?page=${page}`); source.push(...result.cards); if ((page + 1) * 100 >= result.total || !result.cards.length) break; } } catch (e) { toast((e as Error).message); return; } } }
-    else if (!pool && !demo && selectedId && mode !== 'review' && (activeSet?.card_count || 0) > activeCards.length) {
-      try { source = await fetchAllCards(selectedId); } catch (e) { toast((e as Error).message); return; }
+    const isDue = (c: Card) => !c.progress || new Date(c.progress.due_at) <= new Date();
+    // Switch screens right away and show a placeholder while cards load.
+    setDeck([]); setPreparing(true); setView(mode);
+    if (mode === 'review' && globalReview) setSelectedId(null);
+    let source: Card[];
+    try {
+      if (pool) source = pool;
+      else if (mode === 'review' && globalReview) {
+        if (demo) source = allCards.filter(isDue);
+        else { source = []; for (let page = 0; ; page++) { const result = await api(`review?page=${page}`); source.push(...result.cards); if ((page + 1) * 100 >= result.total || !result.cards.length) break; } }
+      } else source = setId ? await cardsOf(setId) : [];
+      if (mode === 'review' && !globalReview && !pool) source = source.filter(isDue);
+    } catch (e) {
+      if (token === modeToken.current) { toast((e as Error).message); setPreparing(false); setView(setId ? 'set' : 'dashboard'); }
+      return;
     }
-    else if (!demo && selectedId && mode === 'review' && (activeSet?.card_count || 0) > activeCards.length) {
-      try { source = (await fetchAllCards(selectedId)).filter(c => !c.progress || new Date(c.progress.due_at) <= new Date()); } catch (e) { toast((e as Error).message); return; }
-    }
+    if (token !== modeToken.current) return;
+    setPreparing(false);
     setStudySource(source);
     let filtered = pool ? source : source.filter(c => filter === 'all' || (filter === 'unmastered' && !c.mastered) || (filter === 'difficult' && c.difficult) || (filter === 'favorite' && c.favorite));
     if (mode === 'review' && demo && globalReview && !filtered.length) filtered = allCards.filter(c => !c.mastered);
@@ -303,7 +376,7 @@ export default function Page() {
   function nextCard() { setIndex(i => i + 1); setFlipped(false); setAnswer(''); setFeedback(null); }
   function previousCard() { setIndex(i => Math.max(0, i - 1)); setFlipped(false); setAnswer(''); setFeedback(null); }
   function changeFilter(next: typeof filter) { setFilter(next); const filtered = studySource.filter(c => next === 'all' || (next === 'unmastered' && !c.mastered) || (next === 'difficult' && c.difficult) || (next === 'favorite' && c.favorite)); setDeck(shuffle(filtered)); setIndex(0); setFlipped(false); }
-  function startTest() { const selected = deck.slice(0, Math.min(testNumber, deck.length)); const choices: Record<string, string[]> = {}; selected.forEach(card => { const distractors = shuffle([...new Set((activeCards.length > deck.length ? activeCards : deck).filter(c => c.id !== card.id).map(c => c.definition).filter(d => normalizeAnswer(d) !== normalizeAnswer(card.definition)))]).slice(0, 3); choices[card.id] = shuffle([card.definition, ...distractors]); }); setDeck(selected); setTestChoices(choices); setTestStarted(true); setStudyStart(Date.now()); }
+  function startTest() { const whole = (selectedId && cardCache.current.get(selectedId)) || activeCards; const selected = deck.slice(0, Math.min(testNumber, deck.length)); const choices: Record<string, string[]> = {}; selected.forEach(card => { const distractors = shuffle([...new Set((whole.length > deck.length ? whole : deck).filter(c => c.id !== card.id).map(c => c.definition).filter(d => normalizeAnswer(d) !== normalizeAnswer(card.definition)))]).slice(0, 3); choices[card.id] = shuffle([card.definition, ...distractors]); }); setDeck(selected); setTestChoices(choices); setTestStarted(true); setStudyStart(Date.now()); }
   useEffect(() => { if (view !== 'flashcards') return; const handler = (e: KeyboardEvent) => { if (e.target instanceof HTMLInputElement || e.target instanceof HTMLTextAreaElement) return; if (e.code === 'Space') { e.preventDefault(); setFlipped(f => !f); } if (e.code === 'ArrowRight') nextCard(); if (e.code === 'ArrowLeft') previousCard(); }; window.addEventListener('keydown', handler); return () => window.removeEventListener('keydown', handler); }, [view]);
   const onLearnFinish = useCallback((masteredCount: number, total: number) => { void saveSession('learn', masteredCount, total); }, [selectedId, deck, studyStart, demo]);
   function chooseMatch(type: 'term' | 'definition', id: string) { if (matched.includes(id)) return; if (!matchSelection) return setMatchSelection({ type, id }); if (matchSelection.type === type) return setMatchSelection({ type, id }); if (matchSelection.id === id) { const next = [...matched, id]; setMatched(next); setMatchSelection(null); setCorrect(c => c + 1); if (next.length === matchTerms.length) saveSession('match', next.length, next.length); } else { setWrongMatch(true); setTimeout(() => { setWrongMatch(false); setMatchSelection(null); }, 500); } }
@@ -311,7 +384,60 @@ export default function Page() {
   async function saveProfile() { try { if (!demo) await api('activity', 'POST', { kind: 'profile', display_name: profileName, learning_language: learningLanguage, daily_goal: dailyGoal }); updateData(d => ({ ...d, profile: { id: userId || 'demo', display_name: profileName, learning_language: learningLanguage, daily_goal: dailyGoal } })); toast('Đã lưu cài đặt.'); } catch (e) { toast((e as Error).message); } }
   async function doAuth(e: React.FormEvent) { e.preventDefault(); const client = supabase(); if (!client) return; setLoading(true); try { if (authMode === 'signup') { const { error } = await client.auth.signUp({ email: authEmail, password: authPassword, options: { data: { display_name: authEmail.split('@')[0] } } }); if (error) throw error; toast('Kiểm tra email để xác nhận tài khoản.'); } else if (authMode === 'login') { const { error } = await client.auth.signInWithPassword({ email: authEmail, password: authPassword }); if (error) throw error; } else if (authMode === 'update') { const { error } = await client.auth.updateUser({ password: authPassword }); if (error) throw error; setAuthMode('login'); toast('Mật khẩu đã được cập nhật.'); } else { const { error } = await client.auth.resetPasswordForEmail(authEmail, { redirectTo: location.origin }); if (error) throw error; toast('Đã gửi email đặt lại mật khẩu.'); } } catch (e) { toast((e as Error).message); } finally { setLoading(false); } }
   async function signInGoogle() { const client = supabase(); if (!client) return; const { error } = await client.auth.signInWithOAuth({ provider: 'google', options: { redirectTo: location.href } }); if (error) toast(error.message); }
-  async function signOut() { await supabase()?.auth.signOut(); setUserId(null); setDemo(false); setData({ sets: [], cards: [], sessions: [], profile: null }); setView('dashboard'); }
+  async function signOut() { setMenuOpen(false); await supabase()?.auth.signOut(); resetRouting(); setUserId(null); setDemo(false); setData({ sets: [], cards: [], sessions: [], profile: null }); setView('dashboard'); cardCache.current.clear(); cardFetches.current.clear(); }
+  /** After signing out, the next sign-in starts from the home page. */
+  function resetRouting() { initialRouted.current = false; routeReady.current = false; history.replaceState({}, '', '/'); }
+
+  /** Open whatever the address bar points to (first load, Back/Forward). */
+  async function applyRoute(path: string) {
+    const { view: next, setId } = parsePath(path);
+    routing.current = true; modeToken.current++; setPreparing(false); setMenuOpen(false);
+    try {
+      if (!setId) {
+        if (next === 'editor') return void await openEditor();
+        if (next === 'review') return void await beginMode('review', true);
+        setView(next); return;
+      }
+      let set = data.sets.find(s => s.id === setId) || discoveredSets.find(s => s.id === setId) || sharedSets.find(s => s.id === setId);
+      if (!set && !demo) {
+        try { set = (await api(`sets?id=${setId}`)).sets?.[0]; } catch { set = undefined; }
+        const found = set; if (found) setDiscoveredSets(old => [found, ...old.filter(s => s.id !== found.id)]);
+      }
+      if (!set) { toast('Bộ từ không tồn tại hoặc bạn không có quyền xem.'); history.replaceState({}, '', '/'); setView('dashboard'); return; }
+      setSelectedId(set.id); setCardPage(0);
+      const canEdit = demo || set.owner_id === userId || set.access_role === 'editor';
+      if (next === 'editor' && canEdit) return void await openEditor(set);
+      if (next === 'set' || next === 'editor') { setView('set'); if (!demo) void loadCards(set.id); return; }
+      if (!demo) void loadCards(set.id);
+      await beginMode(next, false, undefined, set.id);
+    } finally { routing.current = false; }
+  }
+  const applyRouteRef = useRef(applyRoute); applyRouteRef.current = applyRoute;
+  const onPopRef = useRef<() => void>(() => undefined);
+  onPopRef.current = () => {
+    if (!canLeaveEditor()) { history.pushState({}, '', pathFor(view, selectedId, editor?.setId)); return; }
+    void applyRoute(location.pathname);
+  };
+  useEffect(() => { const onPop = () => onPopRef.current(); window.addEventListener('popstate', onPop); return () => window.removeEventListener('popstate', onPop); }, []);
+  useEffect(() => {
+    if (initialRouted.current || !authReady || !(demo ? data.profile : userId)) return;
+    initialRouted.current = true;
+    const params = new URLSearchParams(location.search);
+    if (params.get('set') || params.get('invite') || location.pathname === '/') { routeReady.current = true; return; }
+    void applyRouteRef.current(location.pathname).finally(() => { routeReady.current = true; });
+  }, [authReady, userId, demo, data.profile]);
+  // Keep the address bar in step with the screen.
+  useEffect(() => {
+    if (!routeReady.current || routing.current) return;
+    const path = pathFor(view, selectedId, editor?.setId);
+    if (path !== location.pathname) history.pushState({}, '', path);
+  }, [view, selectedId, editor?.setId]);
+  useEffect(() => {
+    if (!menuOpen) return;
+    const close = (e: MouseEvent | KeyboardEvent) => { if (e instanceof KeyboardEvent ? e.key === 'Escape' : !menuRef.current?.contains(e.target as Node)) setMenuOpen(false); };
+    document.addEventListener('mousedown', close); document.addEventListener('keydown', close);
+    return () => { document.removeEventListener('mousedown', close); document.removeEventListener('keydown', close); };
+  }, [menuOpen]);
 
   const filteredSets = useMemo(() => data.sets.filter(s => (folderFilter === 'all' || s.folder_id === folderFilter) && `${s.title} ${s.description} ${(s.tags || []).join(' ')}`.toLowerCase().includes(search.toLowerCase())), [data.sets, search, folderFilter]);
   const activityByDay = useMemo(() => Array.from({ length: 7 }, (_, i) => { const date = new Date(); date.setDate(date.getDate() - (6 - i)); return { label: ['CN', 'T2', 'T3', 'T4', 'T5', 'T6', 'T7'][date.getDay()], value: data.sessions.filter(s => new Date(s.created_at).toDateString() === date.toDateString()).reduce((n, s) => n + s.total, 0) }; }), [data.sessions]);
@@ -324,7 +450,8 @@ export default function Page() {
   /** Search lives on the Library/Discover pages; the header button jumps there and focuses it. */
   function openSearch() { if (view !== 'library' && view !== 'discover' && !go('library')) return; setTimeout(() => document.getElementById('page-search')?.focus(), 250); }
   const searchBox = <div className="search page-search"><Search size={17} /><input id="page-search" type="search" aria-label="Tìm kiếm bộ từ" value={search} onChange={e => setSearch(e.target.value)} placeholder="Tìm bộ từ, chủ đề…" />{search && <button className="icon-button plain" aria-label="Xoá tìm kiếm" onClick={() => setSearch('')}><X size={15} /></button>}</div>;
-  const exitDemo = () => { setDemo(false); setData({ sets: [], cards: [], sessions: [], profile: null }); };
+  const exitDemo = () => { setMenuOpen(false); resetRouting(); setDemo(false); setView('dashboard'); setData({ sets: [], cards: [], sessions: [], profile: null }); };
+  const menuGo = (next: View) => { setMenuOpen(false); go(next); };
 
   if (!authReady) return <div className="splash"><div className="brand-mark"><Heart size={20} fill="currentColor" /></div><div className="skeleton" style={{ width: 180, height: 14 }} /></div>;
 
@@ -376,7 +503,17 @@ export default function Page() {
           <button className="icon-button" aria-label="Tìm bộ từ" title="Tìm bộ từ" onClick={openSearch}><Search size={17} /></button>
           <button className="icon-button" aria-label={dark ? 'Chuyển sang giao diện sáng' : 'Chuyển sang giao diện tối'} title={dark ? 'Giao diện sáng' : 'Giao diện tối'} onClick={() => setDark(v => !v)}>{dark ? <Sun size={17} /> : <Moon size={17} />}</button>
           <button className="btn primary small top-create" onClick={() => openEditor()}><Plus /> Tạo bộ từ</button>
-          <button className="avatar" aria-label="Hồ sơ và cài đặt" title="Hồ sơ và cài đặt" onClick={() => go('settings')}>{(data.profile?.display_name || 'V').charAt(0).toUpperCase()}</button>
+          <div className="menu-wrap" ref={menuRef}>
+            <button className="avatar" aria-label="Tài khoản" title="Tài khoản" aria-haspopup="menu" aria-expanded={menuOpen} onClick={() => setMenuOpen(v => !v)}>{(data.profile?.display_name || 'V').charAt(0).toUpperCase()}</button>
+            {menuOpen && <div className="account-menu" role="menu">
+              <div className="menu-head"><strong>{data.profile?.display_name || 'Bạn'}</strong><small>{demo ? 'Đang dùng thử' : 'Đã đăng nhập'}</small></div>
+              <button role="menuitem" onClick={() => menuGo('discover')}><Globe2 size={16} /> Khám phá</button>
+              <button role="menuitem" onClick={() => menuGo('shared')}><Users size={16} /> Được chia sẻ</button>
+              <button role="menuitem" onClick={() => menuGo('stats')}><ChartNoAxesColumn size={16} /> Thống kê</button>
+              <button role="menuitem" onClick={() => menuGo('settings')}><Settings2 size={16} /> Cài đặt</button>
+              <button role="menuitem" className="danger" onClick={demo ? exitDemo : signOut}><LogOut size={16} /> {demo ? 'Thoát dùng thử' : 'Đăng xuất'}</button>
+            </div>}
+          </div>
         </div>
       </div>
     </header>}
@@ -421,7 +558,7 @@ export default function Page() {
         </>}
 
         {view === 'shared' && <SharedPanel sets={sharedSets} total={sharedTotal} onOpen={openSet} onMore={() => loadShared(sharedPage + 1)} />}
-        {view === 'discover' && <DiscoverPanel searchBox={searchBox} sets={discoveredSets} total={discoveredTotal} onOpen={openSet} onMore={() => loadDiscover(discoveredPage + 1, search)} onCreate={() => openEditor()} />}
+        {view === 'discover' && <DiscoverPanel searchBox={searchBox} isMine={s => demo || s.owner_id === userId} sets={discoveredSets} total={discoveredTotal} onOpen={openSet} onMore={() => loadDiscover(discoveredPage + 1, search)} onCreate={() => openEditor()} />}
 
         {view === 'editor' && editor && <SetEditor key={editor.setId || 'new'} mode={editor.mode} initialSet={editor.set} initialCards={editor.cards} canEditMeta={editor.mode === 'create' || demo || (data.sets.find(s => s.id === editor.setId) || sharedSets.find(s => s.id === editor.setId) || discoveredSets.find(s => s.id === editor.setId))?.owner_id === userId} folders={data.folders || []} focusKey={editor.focusKey} openImport={editor.openImport} saving={editorSaving} savingLabel={saveProgress} onCancel={closeEditor} onSave={saveEditor} onDirtyChange={dirty => { editorDirty.current = dirty; }} notify={toast} />}
 
@@ -459,12 +596,12 @@ export default function Page() {
 
         {inStudy && <div className="study-wrap">
           <div className="study-top">
-            <button className="btn ghost small" onClick={() => setView(selectedId ? 'set' : 'dashboard')}><X /> Thoát</button>
+            <button className="btn ghost small" onClick={() => leaveStudy(selectedId ? 'set' : 'dashboard')}><X /> Thoát</button>
             <div className="study-title"><span className={`tone-icon sm ${modes.find(m => m.id === view)?.tone}`}>{(() => { const M = modes.find(m => m.id === view)?.icon || Layers3; return <M size={15} />; })()}</span><strong>{modes.find(m => m.id === view)?.name}</strong>{activeSet && <span className="muted hide-sm">· {activeSet.title}</span>}</div>
             <span className="study-count">{view === 'learn' ? '' : view === 'match' ? `${matched.length}/${matchTerms.length}` : `${Math.min(index + 1, deck.length)}/${deck.length}`}</span>
           </div>
           {view !== 'test' && view !== 'learn' && <div className="study-progress" role="progressbar" aria-label="Tiến độ" aria-valuemin={0} aria-valuemax={100} aria-valuenow={Math.round(view === 'match' ? matched.length / Math.max(1, matchTerms.length) * 100 : Math.min(index + 1, deck.length) / Math.max(1, deck.length) * 100)}><span style={{ width: `${view === 'match' ? matched.length / Math.max(1, matchTerms.length) * 100 : Math.min(index + 1, deck.length) / Math.max(1, deck.length) * 100}%` }} /></div>}
-          {deck.length === 0 ? <Empty title="Chưa có thẻ để học" text="Thêm thẻ vào bộ từ, hoặc quay lại sau khi có từ cần ôn." action="Về thư viện" onClick={() => setView('library')} /> : <>
+          {preparing ? <div className="study-loading" role="status" aria-label="Đang tải thẻ"><div className="skeleton" style={{ height: 300 }} /><div className="skeleton" style={{ height: 52, marginTop: 14 }} /></div> : deck.length === 0 ? <Empty title="Chưa có thẻ để học" text="Thêm thẻ vào bộ từ, hoặc quay lại sau khi có từ cần ôn." action="Về thư viện" onClick={() => setView('library')} /> : <>
 
             {view === 'flashcards' && <>
               {index >= deck.length ? <Result correct={correct} total={deck.length} onAgain={() => beginMode('flashcards')} onBack={() => setView('set')} /> : <>
@@ -562,6 +699,8 @@ export default function Page() {
             <hr />
             <div className="between"><div><strong>Giao diện tối</strong><p className="muted small" style={{ margin: 0 }}>Dễ chịu hơn khi học vào buổi tối</p></div><button className={`switch ${dark ? 'on' : ''}`} role="switch" aria-checked={dark} aria-label="Giao diện tối" onClick={() => setDark(v => !v)}><span /></button></div>
             {demo && <p className="muted small" style={{ marginTop: 24 }}>Dữ liệu demo chỉ lưu trên trình duyệt hiện tại. Đăng nhập để đồng bộ.</p>}
+            <hr />
+            <div className="between"><div><strong>Tài khoản</strong><p className="muted small" style={{ margin: 0 }}>{demo ? 'Bạn đang dùng thử' : 'Đăng xuất khỏi thiết bị này'}</p></div><button className="btn danger-soft" onClick={demo ? exitDemo : signOut}><LogOut /> {demo ? 'Thoát dùng thử' : 'Đăng xuất'}</button></div>
           </div>
         </>}
       </div></div>
@@ -636,10 +775,21 @@ function SetPreview({ cards, onExpand, onSpeak }: { cards: Card[]; onExpand: () 
 }
 
 function Stat({ icon: Icon, label, value, caption, tone }: { icon: typeof BookOpen; label: string; value: number | string; caption: string; tone: Tone }) { return <div className={`stat-card ${tone}`}><div className="stat-top"><span>{label}</span><span className={`tone-icon sm ${tone}`}><Icon size={16} /></span></div><div className="stat-number">{value}</div><div className="stat-caption">{caption}</div></div>; }
-function SetCard({ set, onClick }: { set: SetRecord; onClick: () => void }) { return <button className="set-card" onClick={onClick}><div className={`set-art ${set.cover_color || 'violet'}`}><BookOpen /></div><h3>{set.title}</h3><p>{set.description || `${set.source_language} → ${set.target_language}`}</p><div className="set-meta"><span className="pill">{set.card_count || 0} thẻ</span><span>{set.visibility === 'public' ? 'Công khai' : 'Riêng tư'}</span></div></button>; }
+/** `mine` is passed on community lists (Discover) to tell your own sets apart from other people's. */
+function SetCard({ set, onClick, mine }: { set: SetRecord; onClick: () => void; mine?: boolean }) {
+  return <button className="set-card" onClick={onClick}>
+    <div className={`set-art ${set.cover_color || 'violet'}`}><BookOpen /></div>
+    <h3>{set.title}</h3>
+    <p>{set.description || `${set.source_language} → ${set.target_language}`}</p>
+    <div className="set-meta"><span className="pill">{set.card_count || 0} thẻ</span>
+      {mine === undefined ? <span className="set-vis">{set.visibility === 'public' ? <><Globe2 size={12} /> Công khai</> : 'Riêng tư'}</span>
+        : mine ? <span className="set-owner mine">Của bạn</span> : <span className="set-vis">{set.source_language} → {set.target_language}</span>}
+    </div>
+  </button>;
+}
 function Empty({ title, text, action, onClick }: { title: string; text: string; action: string; onClick: () => void }) { return <div className="empty"><span className="tone-icon violet"><BookOpen size={22} /></span><h3>{title}</h3><p>{text}</p><Button onClick={onClick}>{action} <ArrowRight /></Button></div>; }
 function Result({ correct, total, onAgain, onBack, extra }: { correct: number; total: number; onAgain: () => void; onBack: () => void; extra?: string }) { const pct = Math.round(correct / Math.max(1, total) * 100); return <div className="panel result"><span className="tone-icon green big"><Trophy size={26} /></span><h1>{pct >= 80 ? 'Xuất sắc!' : pct >= 50 ? 'Làm tốt lắm!' : 'Tiếp tục cố gắng nhé!'}</h1><p className="muted">Bạn đã hoàn thành lượt học này.</p><div className="result-score"><strong>{correct}/{total}</strong><span>đúng · {pct}%</span></div>{extra && <p className="muted small">{extra}</p>}<div className="study-controls"><button className="btn" onClick={onBack}>Quay lại bộ từ</button><button className="btn primary" onClick={onAgain}><RotateCcw /> Học lại</button></div></div>; }
-function DiscoverPanel({ searchBox, sets, total, onOpen, onMore, onCreate }: { searchBox: React.ReactNode; sets: SetRecord[]; total: number; onOpen: (id: string) => void; onMore: () => void; onCreate: () => void }) { return <><div className="welcome"><h1>Khám phá bộ từ</h1><p>{total} bộ từ được chia sẻ công khai bởi mọi người.</p></div>{searchBox}{sets.length ? <div className="set-grid">{sets.map(s => <SetCard key={s.id} set={s} onClick={() => onOpen(s.id)} />)}</div> : <Empty title="Chưa có bộ từ công khai" text="Hãy tạo bộ từ và chọn “Mọi người” ở quyền xem để chia sẻ." action="Tạo bộ từ" onClick={onCreate} />}{sets.length < total && <div className="center-row"><button className="btn" onClick={onMore}>Tải thêm <ChevronRight /></button></div>}</>; }
+function DiscoverPanel({ searchBox, sets, total, isMine, onOpen, onMore, onCreate }: { searchBox: React.ReactNode; sets: SetRecord[]; total: number; isMine: (set: SetRecord) => boolean; onOpen: (id: string) => void; onMore: () => void; onCreate: () => void }) { return <><div className="welcome"><h1>Khám phá bộ từ</h1><p>{total} bộ từ được chia sẻ công khai bởi mọi người.</p></div>{searchBox}{sets.length ? <div className="set-grid">{sets.map(s => <SetCard key={s.id} set={s} mine={isMine(s)} onClick={() => onOpen(s.id)} />)}</div> : <Empty title="Chưa có bộ từ công khai" text="Hãy tạo bộ từ và chọn “Mọi người” ở quyền xem để chia sẻ." action="Tạo bộ từ" onClick={onCreate} />}{sets.length < total && <div className="center-row"><button className="btn" onClick={onMore}>Tải thêm <ChevronRight /></button></div>}</>; }
 function FolderBar({ folders, selected, onSelect, onAdd, onEdit, onDelete }: { folders: Folder[]; selected: string; onSelect: (id: string) => void; onAdd: () => void; onEdit: (folder: Folder) => void; onDelete: (folder: Folder) => void }) {
   const current = folders.find(f => f.id === selected);
   return <div className="folder-bar">

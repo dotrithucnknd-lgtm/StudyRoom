@@ -22,7 +22,9 @@ export async function GET(request: NextRequest) {
   const auth = await authorized(request); if (auth instanceof NextResponse) return auth;
   const id = request.nextUrl.searchParams.get('set'); if (!z.string().uuid().safeParse(id).success) return failure(new Error('ID không hợp lệ.'));
   const page = Math.max(0, Math.min(10000, Math.trunc(Number(request.nextUrl.searchParams.get('page') || 0) || 0)));
-  const { data, error, count } = await auth.db.from('flashcards').select('*, card_progress(*)', { count: 'exact' }).eq('set_id', id).order('position').range(page * 100, page * 100 + 99);
+  // Study modes load a whole set at once; 1000 is Supabase's default row cap per request.
+  const size = Math.max(1, Math.min(1000, Math.trunc(Number(request.nextUrl.searchParams.get('size') || 100) || 100)));
+  const { data, error, count } = await auth.db.from('flashcards').select('*, card_progress(*)', { count: 'exact' }).eq('set_id', id).order('position').range(page * size, page * size + size - 1);
   return error ? failure(error) : NextResponse.json({ cards: (data || []).map(c => ({ ...c, progress: c.card_progress?.find((p: { user_id: string }) => p.user_id === auth.userId) })), total: count });
 }
 export async function POST(request: NextRequest) {
